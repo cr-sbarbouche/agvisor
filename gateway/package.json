@@ -1,0 +1,9 @@
+{
+  "name": "agvisor-gateway",
+  "version": "0.1.0",
+  "description": "WebSocket <-> guacd bridge for the <agvisor-desktop> component",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node gateway.js" },
+  "dependencies": { "guacamole-lite": "^1.2.0" }
+}

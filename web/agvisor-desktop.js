@@ -38,7 +38,8 @@ class AgvisorDesktop extends Base {
     const token = this.getAttribute('token');
     if (!this.isConnected || !gateway || !token) return;
 
-    const client = (this.#client = new Guacamole.Client(new Guacamole.WebSocketTunnel(gateway)));
+    const tunnel = new Guacamole.WebSocketTunnel(gateway);
+    const client = (this.#client = new Guacamole.Client(tunnel));
     const display = client.getDisplay().getElement();
     this.append(display);
 
@@ -50,7 +51,9 @@ class AgvisorDesktop extends Base {
     keys.onkeydown = (k) => client.sendKeyEvent(1, k);
     keys.onkeyup = (k) => client.sendKeyEvent(0, k);
     this.onblur = () => keys.reset(); // no stuck modifier keys when focus leaves
-    client.onerror = (s) => this.dispatchEvent(new CustomEvent('error', { detail: s.message }));
+    const fail = (s) => this.dispatchEvent(new CustomEvent('error', { detail: s.message || `connection failed (guacamole status ${s.code})` }));
+    client.onerror = fail; // errors the remote side declares
+    tunnel.onerror = fail; // a failed or lost connection: rejected/expired token, gateway down, network drop
 
     let t;
     this.#ro = new ResizeObserver(() => {

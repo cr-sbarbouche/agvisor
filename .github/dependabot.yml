@@ -25,6 +25,31 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
+  - package-ecosystem: npm # gateway/package.json + gateway/package-lock.json
+    directory: /gateway
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker # gateway/Dockerfile: the digest-pinned node base image
+    directory: /gateway
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker-compose # docker-compose.yml: the digest-pinned guacd image
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: github-actions # keeps the SHA-pinned actions in the workflows current
     directory: /
     schedule:

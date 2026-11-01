@@ -1,0 +1,28 @@
+# Browser GUI stack for agvisor: guacd (RDP proxy) + the WebSocket gateway behind <agvisor-desktop>.
+# Linux host only: both use the host network so guacd can reach the sandboxes' RDP ports on 127.0.0.1.
+# Both listen on 127.0.0.1 only: put your TLS reverse proxy and your auth in front of the gateway port.
+#
+#   export AGVISOR_KEY=$(openssl rand -hex 32)   # keep it: Sandbox.desktop_token() needs the same key
+#   docker compose up -d --build
+services:
+  guacd:
+    image: guacamole/guacd:1.6.0@sha256:8974eaa9ba32f713daf311e7cc8cd7e4cdfba1edea39eed75524e78ef4b08f4f
+    network_mode: host
+    # The image's own entrypoint hardcodes `-b 0.0.0.0`, which on host networking is an open RDP proxy. Bypass it.
+    entrypoint: ["/opt/guacamole/sbin/guacd"]
+    command: ["-f", "-b", "127.0.0.1", "-L", "info"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    network_mode: host
+    environment:
+      AGVISOR_KEY: ${AGVISOR_KEY:?set AGVISOR_KEY first (openssl rand -hex 32)}
+      HOST: 127.0.0.1
+      PORT: ${GATEWAY_PORT:-8090} # not 8080: that one is often taken
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [guacd]
+    restart: unless-stopped
