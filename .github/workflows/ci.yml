@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request: # includes Dependabot's update PRs: a bad update shows up red
+  schedule:
+    - cron: "0 6 * * 1" # weekly: new advisories land without any commit
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to a commit SHA (a tag can be moved); Dependabot keeps them current.
+# ponytail: the two scanners below are pinned inline, so Dependabot can't bump them: update by hand.
+env:
+  PIP_AUDIT_VERSION: "2.10.1"
+  SEMGREP_VERSION: "1.183.0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: uv sync --locked --extra web # --locked: fail if uv.lock is out of date with pyproject.toml
+      - run: uv run python tests/test_args.py
+      - run: npm ci --ignore-scripts # no dependency install scripts
+        working-directory: web
+      - run: npm test # token round trip: Python -> real gateway -> fake guacd
+        working-directory: web
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+
+  audit: # known-vulnerable dependencies, checked against the locked versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: pip-audit (runtime deps + the web extra, exactly as locked)
+        run: |
+          uv export --locked --no-dev --extra web --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
+          uvx "pip-audit==$PIP_AUDIT_VERSION" -r "$RUNNER_TEMP/requirements.txt" --disable-pip --no-deps --strict
+      - name: "npm audit (includes devDependencies, since the gateway runs from a checkout)"
+        working-directory: web
+        run: |
+          npm ci --ignore-scripts
+          npm audit
+          npm audit signatures
+
+  semgrep: # vulnerable code patterns in the Python, JS and the workflows themselves
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # not CodeQL: on a private repo it needs GitHub Advanced Security. Swap it in if the repo goes public.
+      - run: >
+          uvx --from "semgrep==$SEMGREP_VERSION" semgrep scan --metrics off --error
+          --config p/python --config p/javascript --config p/github-actions
+          src web/agvisor-desktop.js web/gateway.js web/e2e.mjs .github
