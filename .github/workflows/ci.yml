@@ -34,12 +34,20 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            gateway/package-lock.json
       - run: uv sync --locked --extra web # --locked: fail if uv.lock is out of date with pyproject.toml
       - run: uv run python tests/test_args.py
       - run: npm ci --ignore-scripts # no dependency install scripts
         working-directory: web
+      - run: npm ci --ignore-scripts
+        working-directory: gateway
       - run: npm test # token round trip: Python -> real gateway -> fake guacd
+        working-directory: web
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+      - run: npm run test:browser # <agvisor-desktop> in real Chrome (preinstalled on the runner) via the real gateway
         working-directory: web
         env:
           PYTHON: ${{ github.workspace }}/.venv/bin/python
@@ -59,12 +67,11 @@ jobs:
         run: |
           uv export --locked --no-dev --extra web --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
           uvx "pip-audit==$PIP_AUDIT_VERSION" -r "$RUNNER_TEMP/requirements.txt" --disable-pip --no-deps --strict
-      - name: "npm audit (includes devDependencies, since the gateway runs from a checkout)"
-        working-directory: web
+      - name: npm audit (the browser component and the gateway, dev dependencies included)
         run: |
-          npm ci --ignore-scripts
-          npm audit
-          npm audit signatures
+          for dir in web gateway; do
+            (cd "$dir" && npm ci --ignore-scripts && npm audit && npm audit signatures)
+          done
 
   semgrep: # vulnerable code patterns in the Python, JS and the workflows themselves
     runs-on: ubuntu-latest
@@ -77,5 +84,5 @@ jobs:
       # not CodeQL: on a private repo it needs GitHub Advanced Security. Swap it in if the repo goes public.
       - run: >
           uvx --from "semgrep==$SEMGREP_VERSION" semgrep scan --metrics off --error
-          --config p/python --config p/javascript --config p/github-actions
-          src web/agvisor-desktop.js web/gateway.js web/e2e.mjs .github
+          --config p/python --config p/javascript --config p/github-actions --config p/dockerfile
+          src web/agvisor-desktop.js gateway/gateway.js gateway/Dockerfile web/e2e.mjs .github

@@ -75,17 +75,15 @@ For a remote host the RDP port is on that host's `127.0.0.1`: tunnel it with `ss
 
 ## GUI in a web page (React, Next.js, Vue, plain HTML)
 
-Browsers can't speak RDP, so there is a gateway in between: `browser <-wss-> web/gateway.js <-> guacd <-RDP-> sandbox`.
-Run these on the docker host (`pip install 'agvisor[web]'` for the token helper):
+Browsers can't speak RDP, so there is a gateway in between: `browser <-wss-> gateway/gateway.js <-> guacd <-RDP-> sandbox`.
+Start both on the docker host with the compose file (`pip install 'agvisor[web]'` for the token helper):
 
 ```sh
-# guacd, loopback only (the image's default entrypoint binds 0.0.0.0, an open RDP proxy on host networking)
-docker run -d --name agvisor-guacd --restart=unless-stopped --network=host \
-  --entrypoint /opt/guacamole/sbin/guacd guacamole/guacd -f -b 127.0.0.1 -L info
-
-export AGVISOR_KEY=$(openssl rand -hex 32)          # shared by the gateway and your backend
-cd web && npm install && npm run gateway            # listens on 127.0.0.1:8080
+export AGVISOR_KEY=$(openssl rand -hex 32)   # shared by the gateway and your backend; compose refuses to start without it
+docker compose up -d --build                 # guacd + gateway, both on 127.0.0.1; gateway on :8090 (GATEWAY_PORT to change)
 ```
+
+The compose file pins both images by digest, binds `guacd` to loopback (its image defaults to `0.0.0.0`, an open RDP proxy on host networking), and runs the gateway as a non-root, read-only container. Linux only: both use the host network. Without Docker: `cd gateway && npm install && npm start`, plus `guacd` bound to `127.0.0.1`.
 
 Put the gateway behind your TLS reverse proxy (so the page uses `wss://`) and your auth. In your backend, after the user is authorised:
 
@@ -107,13 +105,14 @@ import "agvisor-desktop";   // React / Next.js ('use client'): safe to import du
 <agvisor-desktop :gateway="gateway" :token="token" style="width:100%;height:600px"></agvisor-desktop>
 ```
 
-A new `token` reconnects; the element fires an `error` event (`e.detail` = message). TypeScript needs a JSX `IntrinsicElements` entry for the tag.
-A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out. `npm test` in `web/` checks the token round trip against the real gateway with a fake guacd.
+A new `token` reconnects. The element fires an `error` event (`e.detail` = message) when the connection fails or drops, e.g. a rejected or expired token: mint a fresh one and set it. TypeScript needs a JSX `IntrinsicElements` entry for the tag.
+A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out.
+In `web/`: `npm test` checks the token round trip against the real gateway with a fake guacd; `npm run test:browser` runs the component in real Chrome (render, mouse, keyboard, resize, errors, cleanup).
 
 ## CI and dependency updates
 
 - `.github/workflows/ci.yml` runs on every PR, every push to `main`, and weekly (new advisories appear without commits):
-  `test` (Python tests + the gateway token round trip), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows).
+  `test` (Python tests, the gateway token round trip, and the component in real Chrome), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows).
 - `.github/dependabot.yml` opens weekly update PRs for `uv`, `npm` and the GitHub Actions themselves (minor+patch grouped, 7-day cooldown). Those PRs run the same checks.
 - Not configurable from a workflow, set these in the repo settings: make `test`, `audit` and `semgrep` required checks on `main`, and turn on Dependabot alerts.
-- Run it locally: `uv run python tests/test_args.py`, `cd web && npm test`, `uvx pip-audit …`, `uvx semgrep …` (exact commands in `ci.yml`).
+- Run it locally: `uv run python tests/test_args.py`, then in `web/`: `npm test` and `npm run test:browser` (after `npm ci` in both `web/` and `gateway/`), plus `uvx pip-audit …`, `uvx semgrep …` (exact commands in `ci.yml`).

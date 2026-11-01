@@ -1,5 +1,5 @@
-// WebSocket <-> guacd bridge for <agvisor-desktop>. Run from a checkout: `npm install && npm run gateway`.
-// (guacamole-lite is a devDependency on purpose: the browser package must not pull in server code.)
+// WebSocket <-> guacd bridge for <agvisor-desktop>. Run it with `docker compose up` (see ../README.md),
+// or by hand: `npm install && npm start`. Its own package so the browser component stays free of server code.
 // Env: AGVISOR_KEY (64 hex chars, same key as Sandbox.desktop_token), HOST (127.0.0.1), PORT (8080), GUACD_PORT (4822)
 import { createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
 import GuacamoleLite from 'guacamole-lite';

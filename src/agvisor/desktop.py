@@ -1,4 +1,4 @@
-"""GUI sandbox specifics: the GNOME-over-RDP image details and the token for web/gateway.js."""
+"""GUI sandbox specifics: the GNOME-over-RDP image details and the token for gateway/gateway.js."""
 import base64
 import hmac
 import json
@@ -14,7 +14,7 @@ RDP_PORT = 3389
 def make_token(key: bytes, rdp_port: int, password: str, ttl: int = 300) -> str:
     """Token for <agvisor-desktop> (needs `pip install agvisor[web]`). Valid for `ttl` seconds to *open* a session.
 
-    `key` is the 32-byte secret web/gateway.js also has. guacamole-lite can only decrypt AES-CBC, which does
+    `key` is the 32-byte secret gateway/gateway.js also has. guacamole-lite can only decrypt AES-CBC, which does
     not detect tampering: a client could flip IV bits and turn `{"expiration": 1...` into `9...`, making an
     expired token last for centuries. So the token is encrypt-then-MAC: gateway.js checks the HMAC first.
     """
