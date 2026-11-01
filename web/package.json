@@ -1,0 +1,12 @@
+{
+  "name": "agvisor-desktop",
+  "version": "0.1.0",
+  "description": "<agvisor-desktop> web component: view an agvisor GUI sandbox in the browser",
+  "type": "module",
+  "main": "agvisor-desktop.js",
+  "exports": { ".": "./agvisor-desktop.js" },
+  "files": ["agvisor-desktop.js"],
+  "scripts": { "gateway": "node gateway.js", "test": "node e2e.mjs" },
+  "dependencies": { "guacamole-common-js": "^1.5.0" },
+  "devDependencies": { "guacamole-lite": "^1.2.0" }
+}

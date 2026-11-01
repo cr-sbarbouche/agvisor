@@ -1,0 +1,14 @@
+[project]
+name = "agvisor"
+version = "0.1.0"
+description = "gVisor sandboxes for coding agents, with resource limits and optional GUI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+web = ["cryptography>=42"]  # only for Sandbox.desktop_token()
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
