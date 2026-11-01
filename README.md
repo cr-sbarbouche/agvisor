@@ -109,3 +109,11 @@ import "agvisor-desktop";   // React / Next.js ('use client'): safe to import du
 
 A new `token` reconnects; the element fires an `error` event (`e.detail` = message). TypeScript needs a JSX `IntrinsicElements` entry for the tag.
 A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out. `npm test` in `web/` checks the token round trip against the real gateway with a fake guacd.
+
+## CI and dependency updates
+
+- `.github/workflows/ci.yml` runs on every PR, every push to `main`, and weekly (new advisories appear without commits):
+  `test` (Python tests + the gateway token round trip), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows).
+- `.github/dependabot.yml` opens weekly update PRs for `uv`, `npm` and the GitHub Actions themselves (minor+patch grouped, 7-day cooldown). Those PRs run the same checks.
+- Not configurable from a workflow, set these in the repo settings: make `test`, `audit` and `semgrep` required checks on `main`, and turn on Dependabot alerts.
+- Run it locally: `uv run python tests/test_args.py`, `cd web && npm test`, `uvx pip-audit …`, `uvx semgrep …` (exact commands in `ci.yml`).

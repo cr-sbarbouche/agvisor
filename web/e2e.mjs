@@ -53,6 +53,26 @@ try {
   open(mint(-10)); // expired token: gateway must not even open a guacd connection
   await sleep(800);
   assert.equal(got.length, 0, 'expired token reached guacd');
+
+  // CBC alone is malleable: flipping an IV bit edits the first plaintext block, `{"expiration": 1`, so
+  // 1 -> 9 turns an expired token into one valid for centuries. Every such edit must be rejected.
+  const tamper = (token, i) => {
+    const o = JSON.parse(Buffer.from(token, 'base64'));
+    const iv = Buffer.from(o.iv, 'base64');
+    iv[i] ^= 0x08; // '1' (0x31) -> '9' (0x39) when i is the last byte of the first block
+    return Buffer.from(JSON.stringify({ ...o, iv: iv.toString('base64') })).toString('base64');
+  };
+  const expired = mint(-10);
+  for (let i = 0; i < 16; i++) open(tamper(expired, i));
+  await sleep(1500);
+  assert.equal(got.length, 0, 'tampered token reached guacd: the token is not authenticated');
+
+  // The gateway and guacamole-lite must see the same token. A genuine token plus a hidden non-ASCII key:
+  // we decode the outer JSON as UTF-8, guacamole-lite as ASCII, so each would read a different set of keys.
+  const outer = Buffer.from(Buffer.from(mint(60), 'base64').toString('latin1').slice(0, -1)); // drop the final `}`
+  open(Buffer.concat([outer, Buffer.from([0x2c, 0x22, 0xf6, 0x78, 0x22, 0x3a, 0x31, 0x7d])]).toString('base64')); // ,"\xF6x":1}
+  await sleep(1000);
+  assert.equal(got.length, 0, 'a token the gateway and guacamole-lite could read differently reached guacd');
   console.log('ok');
 } catch (e) {
   console.error(e);
