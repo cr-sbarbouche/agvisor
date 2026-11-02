@@ -49,8 +49,16 @@ sb.stop()                                      # without `with`, you stop it you
 | `limits` | `Limits(cpus, memory, pids, shm)`: default 2 cores, `2g`, 512 processes, docker's `/dev/shm` size. Zero or negative values are rejected (docker would read 0 as unlimited) |
 | `network` | `"bridge"` (internet, default) or `"none"` (headless only) |
 | `lifetime` | seconds until the sandbox deletes itself, even if your process dies (headless only) |
+| `idle_ttl` | seconds without an `exec()` before the sandbox deletes itself, even if your process dies (headless only). Expiry can lag by up to ~5s. See below |
 | `name` | makes the sandbox resumable, see below |
 | `host` | `None` = docker on this machine (or `$DOCKER_HOST`); `"ssh://user@host"` = docker on a remote VM/server |
+
+`sb.exec(cmd, input=None, timeout=120)` runs `sh -c cmd` inside and returns a `CompletedProcess`; on timeout the command is killed and `returncode` is 124. That relies on GNU `timeout`, so use Debian/Ubuntu-based images (`python:3.12-slim`, `ubuntu`). On Alpine (busybox) the code is 143 and only the shell is killed: the children of a compound command (`a; b`) keep running. Also don't set an `ENTRYPOINT` in your image: agvisor starts it with `sleep infinity` as arguments.
+
+Under gVisor, the limits behave differently from plain docker (checked on real `runsc`):
+- `pids` budgets the sandbox runtime's *host threads*, not guest processes: an idle sandbox already uses ~35. Keep the default (512): at 64–128, a fork storm made `fork` fail with `Out of memory` and, pushed harder, killed the sandbox.
+- Going over `memory` or `pids` kills the **whole sandbox**, not one process, and the host doesn't notice. Afterwards `exec` returns `returncode` 1 or 128 with `is not running` or `WaitPID` in stderr. Call `create_sandbox(name=...)` again: it starts a fresh container on the same `/workspace` volume.
+- Inside, `uname -r` reports `4.19.0-gvisor` and `/sys/fs/cgroup` and `/sys/class/net` don't exist (use `/proc/net/dev`).
 
 ### Resuming a sandbox
 
@@ -72,6 +80,20 @@ create_sandbox(name="my-project").delete()          # forget it: erases the data
 
 For a remote host the RDP port is on that host's `127.0.0.1`: tunnel it with `ssh -L`.
 `network="none"` cuts network access (headless only: GUI needs the published port).
+
+### Expiry and cleanup
+
+```python
+from agvisor import list_sandboxes
+
+sb = create_sandbox(name="u42", idle_ttl=900, lifetime=4 * 3600)   # gone after 15 idle minutes, or 4h at most
+for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvisor sandbox on that docker host
+    print(sb.name); sb.stop()                                      # exec(), stop() and delete() work on these handles
+```
+
+- `idle_ttl`: the clock restarts when each `exec()` starts and ends; background processes don't count. `exec(timeout=)` must be shorter than `idle_ttl` (else `ValueError`), so a command can't outlive the sandbox. It is fixed at creation, like `limits`.
+- A named sandbox that expires keeps its files: the next `create_sandbox(name=...)` makes a fresh container on the same volume. `delete()` is what erases them: run it from your own retention job.
+- `list_sandboxes()` also finds anonymous sandboxes left behind by a crashed process. Don't `start()` a stopped handle: it would make a fresh default-image container.
 
 ## GUI in a web page (React, Next.js, Vue, plain HTML)
 

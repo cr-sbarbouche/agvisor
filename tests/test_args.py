@@ -2,19 +2,21 @@ import subprocess
 from unittest import mock
 
 from agvisor import Limits, Sandbox
-from agvisor.sandbox import create_sandbox
+from agvisor.sandbox import create_sandbox, list_sandboxes
 
 
 def test_headless():
     a = Sandbox(limits=Limits(cpus=1, memory="512m", pids=64)).run_args()
     assert {"--runtime=runsc", "--cpus=1", "--memory=512m", "--memory-swap=512m", "--pids-limit=64"} <= set(a)
     assert "--privileged" not in a and a[-2:] == ["sleep", "infinity"]
+    assert "--init" in a  # a real PID 1 reaps orphans; `sleep` would leave zombies that eat the pids limit
 
 
 def test_gui_start():
     s = Sandbox(gui=True)
     a = s.run_args()
     assert "--privileged" in a and "--publish=127.0.0.1::3389" in a and a[-1] == "systemd-debian-gnome"
+    assert "--init" not in a  # systemd is PID 1 here
     calls = []
 
     def fake(*args, input=None, **_):
@@ -64,13 +66,13 @@ def test_lifetime_and_validation():
         raise AssertionError(f"accepted {bad}")
 
 
-def fake_docker(inspect_out="", fail=()):
+def fake_docker(inspect_out="", fail=(), ps_out=""):
     """Patchable subprocess.run: records commands; `fail` = words that make a command exit 1."""
     calls = []
 
     def run(cmd, **_):
         calls.append(cmd)
-        out = {"inspect": inspect_out, "port": "127.0.0.1:49153\n"}.get(cmd[1], "")
+        out = {"inspect": inspect_out, "port": "127.0.0.1:49153\n", "ps": ps_out}.get(cmd[1], "")
         bad = any(w in cmd for w in fail)
         return subprocess.CompletedProcess(cmd, 1 if bad else 0, out, "boom" if bad else "")
 
@@ -117,6 +119,46 @@ def test_failed_resume_keeps_the_container():
     assert "rm" not in [c[1] for c in calls]  # we re-attached to someone's container: don't destroy it
 
 
+def test_idle_ttl():
+    a = Sandbox(idle_ttl=60).run_args()
+    assert "--rm" in a and a[-3:-1] == ["sh", "-c"] and "-lt 60 ]" in a[-1]  # PID 1 is the idle watchdog
+    a = Sandbox(idle_ttl=60, lifetime=3600).run_args()  # lifetime stays a hard cap on top of the idle clock
+    assert a[-5:-1] == ["timeout", "3600", "sh", "-c"]
+    for bad in ({"idle_ttl": 0}, {"idle_ttl": -5}, {"idle_ttl": 60, "gui": True}):
+        try:
+            Sandbox(**bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+    sb, seen = Sandbox(idle_ttl=30), []
+    sb._docker = lambda *args, **_: seen.append(args) or subprocess.CompletedProcess(args, 0, "", "")
+    sb.exec("ls", timeout=10)
+    assert "/tmp/.agvisor_active" in seen[0][-1] and seen[0][-1].endswith("; ls")  # exec resets the idle clock
+    try:
+        sb.exec("ls", timeout=30)  # could still be running when the sandbox expires
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("exec timeout >= idle_ttl must be rejected")
+    assert len(seen) == 1  # ...before any docker call
+
+
+def test_list_sandboxes():
+    assert "--label=agvisor=1" in Sandbox().run_args()  # what list_sandboxes() filters on
+    assert "--label=agvisor.name=proj" in Sandbox(name="proj").run_args()
+    assert not any(x.startswith("--label=agvisor.name") for x in Sandbox().run_args())
+
+    calls, run = fake_docker(ps_out="agvisor-proj running proj\nagvisor-ab12cd34 exited \n")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        named, anon = list_sandboxes()
+        anon.stop()  # a leaked anonymous sandbox can be found and killed
+    assert calls[0][1:5] == ["ps", "-a", "--filter", "label=agvisor"]
+    assert (named.name, named.persistent, named._running) == ("agvisor-proj", True, True)
+    assert (anon.name, anon.persistent, anon._running) == ("agvisor-ab12cd34", False, False)
+    assert calls[-1][1:] == ["rm", "-f", "agvisor-ab12cd34"]
+
+
 if __name__ == "__main__":
     test_headless()
     test_gui_start()
@@ -126,4 +168,6 @@ if __name__ == "__main__":
     test_named_sandbox_mounts_volume()
     test_resume_and_delete()
     test_failed_resume_keeps_the_container()
+    test_idle_ttl()
+    test_list_sandboxes()
     print("ok")
