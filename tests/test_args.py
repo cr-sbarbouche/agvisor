@@ -1,4 +1,6 @@
+import os
 import subprocess
+import threading
 from unittest import mock
 
 from agvisor import Limits, Sandbox
@@ -159,6 +161,36 @@ def test_list_sandboxes():
     assert calls[-1][1:] == ["rm", "-f", "agvisor-ab12cd34"]
 
 
+def test_exec_streams_output():
+    r, w = os.pipe()
+    first, got = threading.Event(), []
+
+    def writer():  # the first chunk ends in the middle of "é": it must not come out garbled
+        os.write(w, b"h\xc3")
+        first.wait(5)
+        os.write(w, b"\xa9llo\n")
+        os.close(w)
+
+    class Popen:
+        def __init__(self, cmd, **_):
+            self.cmd, self.stdout, self.returncode = cmd, os.fdopen(r, "rb"), 3
+
+        def wait(self):
+            return self.returncode
+
+    sb = Sandbox(name="proj", host="ssh://u@vm")
+    threading.Thread(target=writer).start()
+    with mock.patch("agvisor.sandbox.subprocess.Popen", Popen):
+        res = sb.exec("echo hi", on_output=lambda t: (got.append(t), first.set()))
+    assert got == ["h", "\u00e9llo\n"] and (res.returncode, res.stdout) == (3, "h\u00e9llo\n")
+    assert res.args[:3] == ["docker", "-H", "ssh://u@vm"] and res.args[3:6] == ["exec", "-i", "agvisor-proj"]
+    try:
+        sb.exec("cat", input="x", on_output=print)
+    except ValueError:
+        return
+    raise AssertionError("accepted stdin together with on_output")
+
+
 if __name__ == "__main__":
     test_headless()
     test_gui_start()
@@ -170,4 +202,5 @@ if __name__ == "__main__":
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()
+    test_exec_streams_output()
     print("ok")
