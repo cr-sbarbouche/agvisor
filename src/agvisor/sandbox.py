@@ -1,3 +1,6 @@
+import codecs
+import collections
+import os
 import re
 import secrets
 import subprocess
@@ -6,6 +9,7 @@ import uuid
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
+_KEEP = 100_000  # exec(on_output=) keeps only this many trailing characters: the rest already went to on_output
 _MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
 
 
@@ -38,6 +42,21 @@ class Sandbox:
         if check and r.returncode:
             raise RuntimeError(r.stderr.strip())
         return r
+
+    def _stream(self, *args, on_output):
+        """Like _docker, but calls on_output(text) as each chunk arrives. stderr is merged into stdout."""
+        cmd = ["docker", *(["-H", self.host] if self.host else []), *args]
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        dec, tail, kept = codecs.getincrementaldecoder("utf-8")("replace"), collections.deque(), 0  # a chunk can end mid-character
+        while chunk := os.read(p.stdout.fileno(), 4096):
+            if text := dec.decode(chunk):
+                tail.append(text)
+                kept += len(text)
+                while kept - len(tail[0]) >= _KEEP:  # a runaway `yes` must not fill our memory
+                    kept -= len(tail.popleft())
+                on_output(text)
+        p.wait()
+        return subprocess.CompletedProcess(cmd, p.returncode, "".join(tail), "")
 
     def run_args(self):
         l = self.limits
@@ -103,8 +122,10 @@ class Sandbox:
             raise
         return self
 
-    def exec(self, cmd, *, input=None, timeout=120):
+    def exec(self, cmd, *, input=None, timeout=120, on_output=None):
         """Run a shell command inside. Returns CompletedProcess; returncode 124 = timed out.
+        `on_output(text)` is called with output as it is produced (stderr merged into stdout, which then holds
+        only the last ~100 KB; it must not raise, and can't be combined with `input`).
         That needs GNU `timeout`, i.e. a Debian/Ubuntu-based image. Alpine's busybox returns 143 instead and kills
         only the shell: the children of a compound command (`a; b`) keep running."""
         if self.idle_ttl:
@@ -114,6 +135,10 @@ class Sandbox:
             # activity = an exec starting or ending (the trap also fires on `exit`)
             cmd = f"trap 'touch {_MARK} 2>/dev/null' EXIT; touch {_MARK} 2>/dev/null; {cmd}"
         argv = ["timeout", "-k", "5", str(timeout), "sh", "-c", cmd]  # kills inside, not just the client
+        if on_output:
+            if input is not None:
+                raise ValueError("on_output can't be combined with input")
+            return self._stream("exec", "-i", self.name, *argv, on_output=on_output)
         return self._docker("exec", "-i", self.name, *argv, input=input, check=False)
 
     def desktop_token(self, key: bytes, ttl=300):
