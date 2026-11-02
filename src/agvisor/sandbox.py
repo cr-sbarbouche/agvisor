@@ -6,18 +6,23 @@ import uuid
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
+_MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
+
 
 class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 name=None, host=None):
+                 idle_ttl=None, name=None, host=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
+        self.idle_ttl = idle_ttl
         self.image = image or (GUI_IMAGE if gui else "ubuntu:24.04")
         if self.image.startswith("-"):  # `docker run ... IMAGE` would parse it as a flag, e.g. --privileged
             raise ValueError(f"invalid image name: {self.image!r}")
         if lifetime is not None and (gui or lifetime <= 0):
             raise ValueError("lifetime must be > 0 seconds and is only supported for headless sandboxes")
+        if idle_ttl is not None and (gui or idle_ttl <= 0):
+            raise ValueError("idle_ttl must be > 0 seconds and is only supported for headless sandboxes")
         # strict: `name` ends up in --name and --volume, where a ',' or ':' would inject mount options
         if name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", name):
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
@@ -39,8 +44,11 @@ class Sandbox:
         a = ["run", "-d", "--runtime=runsc", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
              f"--pids-limit={l.pids}", f"--network={self.network}"]
-        if self.lifetime:  # PID 1 is `sleep <lifetime>`: the container exits, then --rm deletes it, even if we crash
+        if self.lifetime or self.idle_ttl:  # PID 1 ends on its own: the container exits, then --rm deletes it, even if we crash
             a.append("--rm")
+        a.append("--label=agvisor=1")  # what list_sandboxes() finds
+        if self.persistent:
+            a.append(f"--label=agvisor.name={self.name.removeprefix('agvisor-')}")
         if self.data_dir:  # a docker volume is a host directory: it is outside gVisor's discarded rootfs overlay
             a.append(f"--volume={self.name}:{self.data_dir}")
             if not self.gui:
@@ -49,7 +57,20 @@ class Sandbox:
             a += ["--privileged", f"--shm-size={l.shm or '1g'}", f"--publish=127.0.0.1::{RDP_PORT}"]
         elif l.shm:
             a.append(f"--shm-size={l.shm}")
-        return a + [self.image] + ([] if self.gui else ["sleep", str(self.lifetime or "infinity")])
+        if not self.gui:  # PID 1 is `sleep`, which never reaps orphans: they stay zombies and eat the pids limit
+            a.append("--init")  # (gui: systemd is PID 1 and reaps)
+        return a + [self.image] + self._pid1()
+
+    def _pid1(self):
+        if self.gui:
+            return []
+        if not self.idle_ttl:
+            return ["sleep", str(self.lifetime or "infinity")]
+        # exits when the marker is older than idle_ttl (checked every 5s); a missing marker counts as expired.
+        # `timeout` adds lifetime as a hard cap on top.
+        watch = (f"touch {_MARK}; while [ $(( $(date +%s) - $(stat -c %Y {_MARK} 2>/dev/null || echo 0) )) "
+                 f"-lt {self.idle_ttl} ]; do sleep 5; done")
+        return (["timeout", str(self.lifetime)] if self.lifetime else []) + ["sh", "-c", watch]
 
     def _left_running(self):
         """A named container an earlier session never stopped: resume it, processes and all."""
@@ -83,7 +104,15 @@ class Sandbox:
         return self
 
     def exec(self, cmd, *, input=None, timeout=120):
-        """Run a shell command inside. Returns CompletedProcess; returncode 124 = timed out."""
+        """Run a shell command inside. Returns CompletedProcess; returncode 124 = timed out.
+        That needs GNU `timeout`, i.e. a Debian/Ubuntu-based image. Alpine's busybox returns 143 instead and kills
+        only the shell: the children of a compound command (`a; b`) keep running."""
+        if self.idle_ttl:
+            if timeout + 6 >= self.idle_ttl:  # +5 = the kill grace below, +1 = the watchdog compares whole seconds
+                raise ValueError(f"timeout={timeout}s must stay below idle_ttl={self.idle_ttl}s, "
+                                 "or the sandbox could expire in the middle of the command")
+            # activity = an exec starting or ending (the trap also fires on `exit`)
+            cmd = f"trap 'touch {_MARK} 2>/dev/null' EXIT; touch {_MARK} 2>/dev/null; {cmd}"
         argv = ["timeout", "-k", "5", str(timeout), "sh", "-c", cmd]  # kills inside, not just the client
         return self._docker("exec", "-i", self.name, *argv, input=input, check=False)
 
@@ -112,6 +141,23 @@ class Sandbox:
         self.stop()
 
 
+def list_sandboxes(host: str | None = None) -> list[Sandbox]:
+    """Every agvisor sandbox on that docker host, running or not, as handles: exec(), stop() and delete() work.
+    Anonymous ones (leaked by a crashed process) are included, so this is also how you find and kill them.
+    Don't start() a stopped handle: that makes a fresh default-image container."""
+    out = Sandbox(host=host)._docker("ps", "-a", "--filter", "label=agvisor",
+                                     "--format", '{{.Names}} {{.State}} {{.Label "agvisor.name"}}').stdout
+    boxes = []
+    for line in out.splitlines():
+        cname, state, *label = line.split()  # an empty label leaves no third field
+        sb = Sandbox(name=label[0] if label else None, host=host)
+        if not label:
+            sb.name = cname  # anonymous: its random container name is all there is
+        sb._running = state == "running"
+        boxes.append(sb)
+    return boxes
+
+
 def create_sandbox(
     image: str | None = None,
     *,
@@ -119,6 +165,7 @@ def create_sandbox(
     limits: Limits = Limits(),
     network: str = "bridge",
     lifetime: int | None = None,
+    idle_ttl: int | None = None,
     name: str | None = None,
     host: str | None = None,
 ) -> Sandbox:
@@ -136,7 +183,12 @@ def create_sandbox(
     network  "bridge" (internet access, default) or "none" (headless only: gui needs its RDP port).
     lifetime  Seconds until the sandbox destroys itself, even if your process dies. Headless only.
               Default: lives until stop().
-    host      Which machine supplies the resources. None -> docker on this machine (or $DOCKER_HOST).
+    idle_ttl  Seconds without an exec() before the sandbox destroys itself, even if your process dies. The clock
+              restarts when each exec() starts and ends; background processes don't count. exec(timeout=) must be
+              shorter. A named sandbox keeps its files, and create_sandbox(name=same) later makes a fresh
+              container. Combine with lifetime for a hard cap. Headless only. Fixed at creation.
+    host     Which machine supplies the resources. None -> docker on this machine (or $DOCKER_HOST).
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
-    return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, name=name, host=host).start()
+    return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
+                   name=name, host=host).start()
