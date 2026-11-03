@@ -4,7 +4,7 @@ import threading
 from unittest import mock
 
 from agvisor import Limits, Sandbox
-from agvisor.sandbox import create_sandbox, list_sandboxes
+from agvisor.sandbox import _RDP_SETUP, create_sandbox, list_sandboxes
 
 
 def test_headless():
@@ -30,7 +30,36 @@ def test_gui_start():
 
     s._docker = fake
     s.start()
-    assert s.rdp_port == 49153 and calls[-1][1] == f"gnome:{s.password}\n"
+    chpasswd, rdp = calls[-2], calls[-1]
+    assert s.rdp_port == 49153 and chpasswd[1] == f"gnome:{s.password}\n"  # sudo / console password
+    # RDP checks GNOME Remote Desktop's own file (baked as gnome:gnome), not the unix password: it must get ours
+    assert rdp[0][:5] == ("exec", "-i", "-u", "gnome", s.name) and rdp[0][-1].endswith("/gnome-remote-desktop/credentials.ini")
+    assert rdp[1] == f"[RDP]\ncredentials={{'username': <'gnome'>, 'password': <'{s.password}'>}}\n"
+    assert not any(s.password in str(a) for a in rdp[0])  # stdin only: a command line shows up in `ps`
+
+
+def test_gui_setup_failure_cleans_up():
+    calls, run = fake_docker(fail=(_RDP_SETUP,))  # e.g. the desktop never booted
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            create_sandbox(gui=True)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected the RDP setup failure to propagate")
+    assert calls[-1][1:3] == ["rm", "-f"]  # a fresh container that never became usable is not left running
+
+
+def test_runtime():
+    assert "--runtime=runsc" in Sandbox().run_args()
+    assert "--runtime=runsc-gui" in Sandbox(gui=True, runtime="runsc-gui").run_args()
+    for bad in ({"runtime": "--privileged"}, {"runtime": "runsc,x"}, {"runtime": ""},
+                {"gui": True, "runtime": "runc"}, {"gui": True, "runtime": "io.containerd.runc.v2"}):  # gui = --privileged
+        try:
+            Sandbox(**bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
 
 
 def test_create_sandbox_starts_once():
@@ -200,6 +229,8 @@ def test_exec_streams_output():
 if __name__ == "__main__":
     test_headless()
     test_gui_start()
+    test_gui_setup_failure_cleans_up()
+    test_runtime()
     test_create_sandbox_starts_once()
     test_limits_reject_unlimited()
     test_lifetime_and_validation()

@@ -4,13 +4,16 @@ gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI
 
 ## Host setup (Linux VM or server)
 
-Install [gVisor](https://gvisor.dev/docs/user_guide/install/), then register the runtime in `/etc/docker/daemon.json` and restart docker.
-The two `runtimeArgs` are only needed for GUI sandboxes (systemd needs cgroup v2, `sudo` needs suid):
+Install [gVisor](https://gvisor.dev/docs/user_guide/install/), then register the runtime in `/etc/docker/daemon.json` and `systemctl reload docker` (a *restart* bounces every running container unless `live-restore` is on).
+The two `runtimeArgs` are only needed for GUI sandboxes (systemd needs cgroup v2, `sudo` needs suid). Register them as a **second** runtime, so headless sandboxes keep the strict one, and pass `runtime="runsc-gui"` with `gui=True`:
 
 ```json
-{"runtimes": {"runsc": {"path": "/usr/local/bin/runsc",
-  "runtimeArgs": ["--in-sandbox-cgroup=v2", "--allow-suid"]}}}
+{"runtimes": {"runsc": {"path": "/usr/local/bin/runsc"},
+              "runsc-gui": {"path": "/usr/local/bin/runsc",
+                            "runtimeArgs": ["--in-sandbox-cgroup=v2", "--allow-suid"]}}}
 ```
+
+(Putting the args on `runsc` itself also works and needs no `runtime=`, but then every sandbox on the host gets them.)
 
 **On AWS/Azure/GCP VMs:** with `network="bridge"` a sandbox can reach the cloud metadata endpoint (`169.254.169.254`) and read the VM's instance credentials. Block it on the host (untested here): `sudo iptables -I DOCKER-USER -d 169.254.169.254 -j DROP`, or use `network="none"`.
 
@@ -21,6 +24,10 @@ git clone https://github.com/google/gvisor.git && cd gvisor
 docker build -t systemd-debian-gnome \
   -f images/systemd-user/systemd-debian-gnome/Dockerfile.x86_64 images/systemd-user/systemd-debian-gnome
 ```
+
+The image is ~8 GB and the build takes ~30 min on 2 vCPUs (checked on a 2 vCPU / 4 GB VM: peak ~1.5 GB RAM). A desktop needs about 0.7 GB RAM idle, so give it `memory="1536m"` or more.
+
+**Host firewall:** if yours drops traffic from `docker0` (e.g. `INPUT -i docker0 -j DROP`, a common way to keep sandboxes away from the host), the gateway can't reach a desktop on the default bridge: guacd hangs without an error. Create a network for desktops (`docker network create desktops`) and pass `network="desktops"`. Your egress rules don't apply to it, so don't run untrusted code there.
 
 ## Use
 
@@ -45,9 +52,10 @@ sb.stop()                                      # without `with`, you stop it you
 | param | meaning |
 |---|---|
 | `image` | default `ubuntu:24.04`, or the GNOME image when `gui=True` |
-| `gui` | GNOME desktop over RDP |
+| `gui` | GNOME desktop over RDP, with a random RDP password (not the image's `gnome:gnome`). `start()` waits for the desktop to boot: ~30-60 s |
+| `runtime` | docker runtime, default `runsc`. With a separate GUI runtime: `"runsc-gui"`. Must be a gVisor runtime: plain `runc` is refused for `gui` (it runs `--privileged`, which is only simulated under gVisor) |
 | `limits` | `Limits(cpus, memory, pids, shm, disk)`: default 2 cores, `2g`, 512 processes, docker's `/dev/shm` size, `5g` root disk. Zero or negative values are rejected (docker and runsc would read 0 as unlimited) |
-| `network` | `"bridge"` (internet, default) or `"none"` (headless only) |
+| `network` | `"bridge"` (internet, default), `"none"` (headless only) or the name of a docker network you created |
 | `lifetime` | seconds until the sandbox deletes itself, even if your process dies (headless only) |
 | `idle_ttl` | seconds without an `exec()` before the sandbox deletes itself, even if your process dies (headless only). Expiry can lag by up to ~5s. See below |
 | `name` | makes the sandbox resumable, see below |
