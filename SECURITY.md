@@ -8,7 +8,9 @@ Only the latest release gets fixes (0.x: no backports).
 
 ## Reporting a vulnerability
 
-Please don't open a public issue. Email **sadokbarbouche1@outlook.com** with the version, steps to reproduce, and the impact (for example a sandbox escape, a bypassed limit, a forged or replayed gateway token, or an injection through `image`, `name`, `network` or `runtime`).
+Please don't open a public issue for a vulnerability: it would tell everyone about the flaw before there is a fix. Email **sadokbarbouche1@outlook.com** with the version, steps to reproduce, and the impact (for example a sandbox escape, a bypassed limit, a forged or replayed gateway token, or an injection through `image`, `name`, `network` or `runtime`).
+
+For ordinary bugs, questions and feature requests, open a GitHub issue.
 
 ## What to expect
 
