@@ -12,6 +12,9 @@ def test_headless():
     assert {"--runtime=runsc", "--cpus=1", "--memory=512m", "--memory-swap=512m", "--pids-limit=64"} <= set(a)
     assert "--privileged" not in a and a[-2:] == ["sleep", "infinity"]
     assert "--init" in a  # a real PID 1 reaps orphans; `sleep` would leave zombies that eat the pids limit
+    assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=5g" in a  # default disk cap
+    a = Sandbox(limits=Limits(disk="100M"), gui=True).run_args()
+    assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=100M" in a  # gui too; root only, never `all:`
 
 
 def test_gui_start():
@@ -48,7 +51,10 @@ def test_create_sandbox_starts_once():
 
 def test_limits_reject_unlimited():
     Limits(cpus=0.5, memory="512m", pids=1)  # valid
-    for bad in ({"cpus": 0}, {"memory": "0"}, {"memory": "0g"}, {"memory": "lots"}, {"pids": 0}, {"pids": -1}):
+    for ok in ("1", "100k", "512M", "5g", "1T"):  # what runsc accepted on a real VM
+        Limits(disk=ok)
+    bad_disk = [{"disk": d} for d in ("0", "0g", "", "1.5g", "2gb", "-1g", "lots", " 1g", "1g\n")]  # 0 = unlimited in runsc
+    for bad in ({"cpus": 0}, {"memory": "0"}, {"memory": "0g"}, {"memory": "lots"}, {"pids": 0}, {"pids": -1}, *bad_disk):
         try:
             Limits(**bad)
         except ValueError:

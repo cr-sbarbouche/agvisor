@@ -46,7 +46,7 @@ sb.stop()                                      # without `with`, you stop it you
 |---|---|
 | `image` | default `ubuntu:24.04`, or the GNOME image when `gui=True` |
 | `gui` | GNOME desktop over RDP |
-| `limits` | `Limits(cpus, memory, pids, shm)`: default 2 cores, `2g`, 512 processes, docker's `/dev/shm` size. Zero or negative values are rejected (docker would read 0 as unlimited) |
+| `limits` | `Limits(cpus, memory, pids, shm, disk)`: default 2 cores, `2g`, 512 processes, docker's `/dev/shm` size, `5g` root disk. Zero or negative values are rejected (docker and runsc would read 0 as unlimited) |
 | `network` | `"bridge"` (internet, default) or `"none"` (headless only) |
 | `lifetime` | seconds until the sandbox deletes itself, even if your process dies (headless only) |
 | `idle_ttl` | seconds without an `exec()` before the sandbox deletes itself, even if your process dies (headless only). Expiry can lag by up to ~5s. See below |
@@ -58,6 +58,7 @@ sb.stop()                                      # without `with`, you stop it you
 Under gVisor, the limits behave differently from plain docker (checked on real `runsc`):
 - `pids` budgets the sandbox runtime's *host threads*, not guest processes: an idle sandbox already uses ~35. Keep the default (512): at 64–128, a fork storm made `fork` fail with `Out of memory` and, pushed harder, killed the sandbox.
 - Going over `memory` or `pids` kills the **whole sandbox**, not one process, and the host doesn't notice. Afterwards `exec` returns `returncode` 1 or 128 with `is not running` or `WaitPID` in stderr. Call `create_sandbox(name=...)` again: it starts a fresh container on the same `/workspace` volume.
+- `disk` caps the **root filesystem** (runsc's `overlay2` annotation, checked on release-20261026.0): past it, writes fail with `No space left on device` and the sandbox keeps running. Whole number + `k/m/g/t`: `1.5g` and `2gb` are rejected. It does **not** cover `/tmp`, which gVisor backs with RAM (counted in `memory`), nor the `/workspace` volume of a named sandbox: that is a plain host directory with **no size cap**, so a runaway agent can fill the host's disk through it. Until that has a cap, keep `/var/lib/docker` on a disk of its own, and don't share it with anything you care about. `tests/test_gvisor_disk.py` checks the cap against real gVisor.
 - Inside, `uname -r` reports `4.19.0-gvisor` and `/sys/fs/cgroup` and `/sys/class/net` don't exist (use `/proc/net/dev`).
 
 ### Resuming a sandbox
