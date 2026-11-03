@@ -62,7 +62,10 @@ class Sandbox:
         l = self.limits
         a = ["run", "-d", "--runtime=runsc", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
-             f"--pids-limit={l.pids}", f"--network={self.network}"]
+             f"--pids-limit={l.pids}", f"--network={self.network}",
+             # gVisor caps the rootfs overlay (a file on the host disk): writes past it get ENOSPC. Per-container,
+             # no daemon setting needed. `root:` only: `all:` would also overlay /workspace and stop it persisting.
+             f"--annotation=dev.gvisor.flag.overlay2=root:self,size={l.disk}"]
         if self.lifetime or self.idle_ttl:  # PID 1 ends on its own: the container exits, then --rm deletes it, even if we crash
             a.append("--rm")
         a.append("--label=agvisor=1")  # what list_sandboxes() finds
@@ -198,7 +201,8 @@ def create_sandbox(
 
     image     Image to run. Default: ubuntu:24.04, or the GNOME desktop image when gui=True.
     gui       True -> GNOME desktop over RDP (sb.rdp_port, sb.password, sb.desktop_token()).
-    limits    Limits(cpus, memory, pids, shm). Default: 2 cores, 2g RAM, 512 processes. Reusable across sandboxes.
+    limits    Limits(cpus, memory, pids, shm, disk). Default: 2 cores, 2g RAM, 512 processes, 5g root disk.
+              Reusable across sandboxes. `disk` doesn't cover the /workspace volume of a named sandbox.
     name      Makes the sandbox resumable. Files in sb.data_dir (/workspace; the gnome home when gui) are kept
               in a docker volume on the host machine and survive stop(), `with` exit and lifetime expiry.
               create_sandbox(name=same) later gets them back: it re-attaches to the container if an earlier
