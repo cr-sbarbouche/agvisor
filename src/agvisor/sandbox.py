@@ -231,6 +231,8 @@ def create_sandbox(
               create_sandbox(name=same) later gets them back: it re-attaches to the container if an earlier
               session left it running (processes and installed packages intact), else makes a fresh one on the
               same volume. sb.delete() erases the data. Default: anonymous, nothing is kept.
+              There is NO ownership check: anyone who passes the same name gets that sandbox, so namespace
+              names per tenant yourself. The volume has no size cap either (limits.disk covers the rest).
 
     network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
               docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from

@@ -2,6 +2,8 @@
 
 gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids limits, optional GNOME desktop over RDP.
 
+> **Alpha, and not security-audited.** Read [Security](#security) before running code you don't trust.
+
 ## Host setup (Linux VM or server)
 
 Install [gVisor](https://gvisor.dev/docs/user_guide/install/), then register the runtime in `/etc/docker/daemon.json` and `systemctl reload docker` (a *restart* bounces every running container unless `live-restore` is on).
@@ -139,6 +141,19 @@ import "agvisor-desktop";   // React / Next.js ('use client'): safe to import du
 A new `token` reconnects. The element fires an `error` event (`e.detail` = message) when the connection fails or drops, e.g. a rejected or expired token: mint a fresh one and set it. TypeScript needs a JSX `IntrinsicElements` entry for the tag.
 A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out.
 In `web/`: `npm test` checks the token round trip against the real gateway with a fake guacd; `npm run test:browser` runs the component in real Chrome (render, mouse, keyboard, resize, errors, cleanup).
+
+## Security
+
+**This is alpha software and nobody has audited it.** gVisor shrinks the part of the kernel that sandboxed code can reach; it is not a guarantee, and this library's own code has not been reviewed for flaws. Don't use it as the boundary for hostile multi-tenant workloads without a review of your own, and keep `runsc` up to date (tested with release-20261026.0). Known gaps:
+
+- **Whoever can run `docker` on the host controls every sandbox**, and is effectively root on that host. agvisor adds no authentication or authorization: put your own in front of it.
+- **`name=` has no ownership check.** `create_sandbox(name="x")` re-attaches to whatever running container is called `agvisor-x`, removes a stopped one of that name, and `list_sandboxes()` returns every sandbox on the host. If a tenant can choose the name, they can attach to, run commands in, stop and `delete()` another tenant's sandbox. Build names yourself (e.g. `f"{tenant_id}-{run_id}"`) and check ownership before you pass them in.
+- **`/workspace` has no size cap.** `Limits(disk=)` only caps the root filesystem. The `/workspace` volume of a named sandbox is a plain host directory, so a runaway or hostile process can fill the host's disk through it. Anonymous sandboxes have no volume: their writes fall under `disk` (and RAM-backed `/tmp` under `memory`). For named ones, put `/var/lib/docker` on a disk of its own, so a full disk doesn't take other services down with it.
+- **Sandboxes on one docker network can reach each other.** That is Docker's default: every sandbox on `"bridge"` (the default) or on a network you share between tenants can connect to the others' open ports. Use `network="none"`, a separate network per tenant or run, or a network created with `-o com.docker.network.bridge.enable_icc=false` (from Docker's documentation; not tested with agvisor).
+- **`network="bridge"` also reaches the outside:** the internet, services listening on the host itself (through the bridge gateway), and on a cloud VM the metadata endpoint that serves instance credentials (see Host setup). Block what you don't want on the host's firewall, or use `network="none"`.
+- **`gui=True` runs `--privileged`.** Under gVisor that only grants simulated capabilities; under plain `runc` it would be real, so agvisor refuses `runc` for GUI sandboxes. The RDP password is random per sandbox and the gateway token is encrypted and authenticated, but anyone holding a token can open a session until it expires.
+
+To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening a public issue (details in `SECURITY.md`).
 
 ## CI and dependency updates
 
