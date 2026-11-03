@@ -11,15 +11,33 @@ from .limits import Limits
 
 _KEEP = 100_000  # exec(on_output=) keeps only this many trailing characters: the rest already went to on_output
 _MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
+# gui: RDP checks GNOME Remote Desktop's own credentials file, which the image bakes as gnome:gnome, NOT the unix
+# password. Run as GUI_USER with the file on stdin and its path as $1: store ours, wait for the desktop to boot
+# (up to 120 s), restart the RDP service (it reads the file only at startup), wait until it listens on 3389 (0D3D).
+_RDP_CREDS = f"{GUI_HOME}/.local/share/gnome-remote-desktop/credentials.ini"
+_RDP_SETUP = r"""set -e
+umask 077
+cat > "$1"
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+S=gnome-remote-desktop-headless.service
+wait_for() { n=0; until "$@"; do n=$((n+1)); [ $n -le 120 ] || { echo "desktop not ready after 120s: $*" >&2; exit 1; }; sleep 1; done; }
+wait_for systemctl --user is-active --quiet $S
+systemctl --user restart $S
+wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
+"""
+_RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
 
 
 class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, host=None):
+                 idle_ttl=None, name=None, host=None, runtime="runsc"):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
-        self.idle_ttl = idle_ttl
+        self.idle_ttl, self.runtime = idle_ttl, runtime
+        # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", runtime) or (gui and runtime in _RUNC):
+            raise ValueError(f"invalid runtime {runtime!r}: must be a gVisor (runsc) runtime registered in docker")
         self.image = image or (GUI_IMAGE if gui else "ubuntu:24.04")
         if self.image.startswith("-"):  # `docker run ... IMAGE` would parse it as a flag, e.g. --privileged
             raise ValueError(f"invalid image name: {self.image!r}")
@@ -60,7 +78,7 @@ class Sandbox:
 
     def run_args(self):
         l = self.limits
-        a = ["run", "-d", "--runtime=runsc", f"--name={self.name}",
+        a = ["run", "-d", f"--runtime={self.runtime}", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
              f"--pids-limit={l.pids}", f"--network={self.network}",
              # gVisor caps the rootfs overlay (a file on the host disk): writes past it get ENOSPC. Per-container,
@@ -114,9 +132,12 @@ class Sandbox:
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
                 out = self._docker("port", self.name, f"{RDP_PORT}/tcp").stdout
                 self.rdp_port = int(out.splitlines()[0].rsplit(":", 1)[1])
-                self.password = secrets.token_urlsafe(12)
+                self.password = secrets.token_urlsafe(12)  # urlsafe: no quote that could break the file below
                 self._docker("exec", "-i", "-u", "root", self.name, "chpasswd",
-                             input=f"{GUI_USER}:{self.password}\n")
+                             input=f"{GUI_USER}:{self.password}\n")  # sudo / console login
+                creds = f"[RDP]\ncredentials={{'username': <'{GUI_USER}'>, 'password': <'{self.password}'>}}\n"
+                self._docker("exec", "-i", "-u", GUI_USER, self.name, "sh", "-c", _RDP_SETUP, "sh", _RDP_CREDS,
+                             input=creds)  # RDP login; stdin keeps the password out of `ps`. Returns once RDP listens
         except BaseException:
             if resumed:  # never destroy a container (and its processes) that we merely re-attached to
                 self._running = False
@@ -196,11 +217,13 @@ def create_sandbox(
     idle_ttl: int | None = None,
     name: str | None = None,
     host: str | None = None,
+    runtime: str = "runsc",
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
     image     Image to run. Default: ubuntu:24.04, or the GNOME desktop image when gui=True.
-    gui       True -> GNOME desktop over RDP (sb.rdp_port, sb.password, sb.desktop_token()).
+    gui       True -> GNOME desktop over RDP (sb.rdp_port, sb.password, sb.desktop_token()). start() returns once the
+              desktop has booted and RDP listens (~30-60 s).
     limits    Limits(cpus, memory, pids, shm, disk). Default: 2 cores, 2g RAM, 512 processes, 5g root disk.
               Reusable across sandboxes. `disk` doesn't cover the /workspace volume of a named sandbox.
     name      Makes the sandbox resumable. Files in sb.data_dir (/workspace; the gnome home when gui) are kept
@@ -209,7 +232,12 @@ def create_sandbox(
               session left it running (processes and installed packages intact), else makes a fresh one on the
               same volume. sb.delete() erases the data. Default: anonymous, nothing is kept.
 
-    network  "bridge" (internet access, default) or "none" (headless only: gui needs its RDP port).
+    network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
+              docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from
+              reaching a gui sandbox there: use a network of its own.
+    runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
+              flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
+              refused for gui, which runs --privileged.
     lifetime  Seconds until the sandbox destroys itself, even if your process dies. Headless only.
               Default: lives until stop().
     idle_ttl  Seconds without an exec() before the sandbox destroys itself, even if your process dies. The clock
@@ -220,4 +248,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, host=host).start()
+                   name=name, host=host, runtime=runtime).start()
