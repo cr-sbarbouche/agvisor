@@ -18,4 +18,4 @@ requires = ["hatchling>=1.27"]  # SPDX `license = "MIT"` (PEP 639) needs 1.27+
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/notes"]  # internal working notes: keep them out of the published source archive
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/SECURITY.md"]  # the Python package only: not gateway/, web/, CI files
