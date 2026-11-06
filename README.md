@@ -4,6 +4,13 @@
 
 gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids limits, optional GNOME desktop over RDP.
 
+Two packages, versioned separately:
+
+| package | what | install |
+|---|---|---|
+| [`agvisor`](https://pypi.org/project/agvisor/) (PyPI) | the Python library: `create_sandbox(...)`, limits, `list_sandboxes` | `pip install agvisor` |
+| [`agvisor-desktop`](https://www.npmjs.com/package/agvisor-desktop) (npm) | the `<agvisor-desktop>` web component that shows a GUI sandbox in a web page ([details](#gui-in-a-web-page-react-nextjs-vue-plain-html)) | `npm install agvisor-desktop` |
+
 > **Alpha, and not security-audited.** Read [Security](#security) before running code you don't trust.
 
 ## Host setup (Linux VM or server)
@@ -128,10 +135,14 @@ token = sb.desktop_token(bytes.fromhex(os.environ["AGVISOR_KEY"]), ttl=60)  # se
 # return {"gateway": "wss://your.host/desktop", "token": token} to the page
 ```
 
-In the page, give the element a size and pass both values. The component is [`web/agvisor-desktop.js`](web/agvisor-desktop.js); it is **not on npm yet**, so copy that one file into your app and `npm install guacamole-common-js` (its only dependency):
+In the page, give the element a size and pass both values. The component is the npm package [`agvisor-desktop`](https://www.npmjs.com/package/agvisor-desktop) (source in [`web/`](web/); its only dependency is `guacamole-common-js`, installed with it):
+
+```sh
+npm install agvisor-desktop
+```
 
 ```jsx
-import "./agvisor-desktop.js";   // React / Next.js ('use client'): safe to import during SSR, it does nothing on the server
+import "agvisor-desktop";   // React / Next.js ('use client'): safe to import during SSR, it does nothing on the server
 <agvisor-desktop gateway={gateway} token={token} style={{ width: "100%", height: 600 }} />
 ```
 
