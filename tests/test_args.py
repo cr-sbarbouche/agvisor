@@ -1,6 +1,7 @@
 import os
 import subprocess
 import threading
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from agvisor import Limits, Sandbox, SandboxGone
@@ -103,13 +104,16 @@ def test_lifetime_and_validation():
         raise AssertionError(f"accepted {bad}")
 
 
-def fake_docker(inspect_out="", fail=(), ps_out=""):
-    """Patchable subprocess.run: records commands; `fail` = words that make a command exit 1."""
+def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner=""):
+    """Patchable subprocess.run: records commands; `fail` = words that make a command exit 1;
+    `volume_owner` = the agvisor.owner label that `docker volume inspect` reports."""
     calls = []
 
     def run(cmd, **_):
         calls.append(cmd)
         out = {"inspect": inspect_out, "port": "127.0.0.1:49153\n", "ps": ps_out}.get(cmd[1], "")
+        if cmd[1:3] == ["volume", "inspect"]:
+            out = volume_owner + "\n"
         bad = any(w in cmd for w in fail)
         return subprocess.CompletedProcess(cmd, 1 if bad else 0, out, "boom" if bad else "")
 
@@ -135,13 +139,14 @@ def test_resume_and_delete():
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         sb = create_sandbox(name="proj")
         sb.delete()
-    assert [c[1] for c in calls] == ["inspect", "rm", "run", "rm", "volume"]
+    assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["inspect", "-f"], ["rm", "-f"],
+                                       ["run", "-d"], ["rm", "-f"], ["volume", "rm"]]
     assert calls[-1][1:] == ["volume", "rm", "-f", "agvisor-proj"]
 
     calls, run = fake_docker(inspect_out="true\n")  # left running: re-attach, never docker run
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         sb = create_sandbox(name="proj")
-    assert [c[1] for c in calls] == ["inspect"] and sb._running
+    assert [c[1] for c in calls] == ["volume", "volume", "inspect"] and sb._running
 
 
 def test_failed_resume_keeps_the_container():
@@ -186,14 +191,57 @@ def test_list_sandboxes():
     assert "--label=agvisor.name=proj" in Sandbox(name="proj").run_args()
     assert not any(x.startswith("--label=agvisor.name") for x in Sandbox().run_args())
 
-    calls, run = fake_docker(ps_out="agvisor-proj running proj\nagvisor-ab12cd34 exited \n")
+    # name, state, name label, owner label, CreatedAt: tab-separated, labels may be empty
+    calls, run = fake_docker(ps_out="agvisor-proj\trunning\tproj\tu42\t2026-11-06 09:28:33 +0000 UTC\n"
+                                    "agvisor-ab12cd34\texited\t\t\t2026-11-05 23:01:02 +0100 CET\n")
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         named, anon = list_sandboxes()
         anon.stop()  # a leaked anonymous sandbox can be found and killed
-    assert calls[0][1:5] == ["ps", "-a", "--filter", "label=agvisor"]
+    assert calls[0][1:5] == ["ps", "-a", "--filter", "label=agvisor"] and "label=agvisor.owner=u42" not in calls[0]
     assert (named.name, named.persistent, named._running) == ("agvisor-proj", True, True)
     assert (anon.name, anon.persistent, anon._running) == ("agvisor-ab12cd34", False, False)
+    assert (named.owner, anon.owner) == ("u42", None)
+    assert named.created == datetime(2026, 11, 6, 9, 28, 33, tzinfo=timezone.utc)
+    assert anon.created == datetime(2026, 11, 5, 23, 1, 2, tzinfo=timezone(timedelta(hours=1)))  # zone name dropped
     assert calls[-1][1:] == ["rm", "-f", "agvisor-ab12cd34"]
+
+
+def test_owner():
+    assert "--label=agvisor.owner=u42" in Sandbox(owner="u42").run_args()
+    assert not any(x.startswith("--label=agvisor.owner") for x in Sandbox().run_args())
+    for bad in ("", "-x", "a b", "a,b", "x" * 64):
+        try:
+            Sandbox(owner=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted owner {bad!r}")
+
+    calls, run = fake_docker(volume_owner="u42")  # first or matching owner: volume labelled, container created
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(name="proj", owner="u42")
+    assert calls[0][1:] == ["volume", "create", "--label=agvisor.owner=u42", "agvisor-proj"]
+    assert "run" in [c[1] for c in calls]
+
+    for who, kw in (("u99", {"owner": "u99"}), ("nobody", {})):  # another owner, or none: refused before any change
+        calls, run = fake_docker(inspect_out="true\n", volume_owner="u42")
+        with mock.patch("agvisor.sandbox.subprocess.run", run):
+            try:
+                create_sandbox(name="proj", **kw)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError(f"{who} got u42's sandbox")
+        assert {c[2] for c in calls} == {"create", "inspect"} and {c[1] for c in calls} == {"volume"}
+
+    calls, run = fake_docker()  # anonymous: no volume, so nothing to claim
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(owner="u42")
+    assert "volume" not in [c[1] for c in calls]
+
+    calls, run = fake_docker()
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        list_sandboxes(owner="u42")
+    assert calls[0][5:7] == ["--filter", "label=agvisor.owner=u42"]
 
 
 def test_exec_raises_when_the_sandbox_is_gone():
@@ -265,6 +313,7 @@ if __name__ == "__main__":
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()
+    test_owner()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     print("ok")

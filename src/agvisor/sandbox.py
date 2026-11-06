@@ -5,10 +5,12 @@ import re
 import secrets
 import subprocess
 import uuid
+from datetime import datetime
 
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
+_ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}"  # name= and owner=: they end up in --name, --volume and --label
 _KEEP = 100_000  # exec(on_output=) keeps only this many trailing characters: the rest already went to on_output
 _MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
 # gui: RDP checks GNOME Remote Desktop's own credentials file, which the image bakes as gnome:gnome, NOT the unix
@@ -38,7 +40,7 @@ class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, host=None, runtime="runsc"):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc"):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -52,8 +54,12 @@ class Sandbox:
         if idle_ttl is not None and (gui or idle_ttl <= 0):
             raise ValueError("idle_ttl must be > 0 seconds and is only supported for headless sandboxes")
         # strict: `name` ends up in --name and --volume, where a ',' or ':' would inject mount options
-        if name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", name):
+        if name is not None and not re.fullmatch(_ID, name):
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
+        if owner is not None and not re.fullmatch(_ID, owner):
+            raise ValueError(f"invalid owner {owner!r}: letters, digits, '_', '.', '-' only (max 63)")
+        self.owner = owner
+        self.created = None  # a datetime, set by list_sandboxes(); handles from create_sandbox() don't know it
         self.persistent = name is not None
         self.name = f"agvisor-{name or uuid.uuid4().hex[:8]}"  # also the name of the data volume
         self.data_dir = (GUI_HOME if gui else "/workspace") if self.persistent else None  # survives stop()
@@ -93,6 +99,8 @@ class Sandbox:
         if self.lifetime or self.idle_ttl:  # PID 1 ends on its own: the container exits, then --rm deletes it, even if we crash
             a.append("--rm")
         a.append("--label=agvisor=1")  # what list_sandboxes() finds
+        if self.owner:
+            a.append(f"--label=agvisor.owner={self.owner}")
         if self.persistent:
             a.append(f"--label=agvisor.name={self.name.removeprefix('agvisor-')}")
         if self.data_dir:  # a docker volume is a host directory: it is outside gVisor's discarded rootfs overlay
@@ -125,9 +133,20 @@ class Sandbox:
         r = self._docker("inspect", "-f", "{{.State.Running}}", self.name, check=False)
         return r.stdout.strip() == "true"
 
+    def _claim_volume(self):
+        """The data volume of a named sandbox remembers its owner: the first create_sandbox(name=, owner=) labels it,
+        and a different owner (or none) is refused. `volume create` on an existing volume returns it unchanged, so two
+        racing creators can't both win."""
+        self._docker("volume", "create", *([f"--label=agvisor.owner={self.owner}"] if self.owner else []), self.name)
+        have = self._docker("volume", "inspect", "-f", '{{index .Labels "agvisor.owner"}}', self.name).stdout.strip()
+        if have != (self.owner or ""):
+            raise PermissionError(f"sandbox {self.name!r} belongs to another owner")
+
     def start(self):
         if self._running:  # create_sandbox() already started it, then `with` calls start() again
             return self
+        if self.persistent:
+            self._claim_volume()  # before anything can re-attach to, or remove, someone else's container
         resumed = self._left_running()  # limits/image args are ignored then: they were fixed at creation
         if not resumed:
             if self.persistent:  # a stopped leftover would block the name; its data lives in the volume
@@ -207,19 +226,23 @@ class Sandbox:
         self.stop()
 
 
-def list_sandboxes(host: str | None = None) -> list[Sandbox]:
+def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sandbox]:
     """Every agvisor sandbox on that docker host, running or not, as handles: exec(), stop() and delete() work.
+    Each has `.created` (when its container was made) and `.owner`. `owner=` lists only that owner's.
     Anonymous ones (leaked by a crashed process) are included, so this is also how you find and kill them.
     Don't start() a stopped handle: that makes a fresh default-image container."""
+    fmt = "\t".join(["{{.Names}}", "{{.State}}", '{{.Label "agvisor.name"}}', '{{.Label "agvisor.owner"}}', "{{.CreatedAt}}"])
     out = Sandbox(host=host)._docker("ps", "-a", "--filter", "label=agvisor",
-                                     "--format", '{{.Names}} {{.State}} {{.Label "agvisor.name"}}').stdout
+                                     *(["--filter", f"label=agvisor.owner={owner}"] if owner else []),
+                                     "--format", fmt).stdout
     boxes = []
     for line in out.splitlines():
-        cname, state, *label = line.split()  # an empty label leaves no third field
-        sb = Sandbox(name=label[0] if label else None, host=host)
+        cname, state, label, own, created = line.split("\t")  # tabs: CreatedAt has spaces, a label can be empty
+        sb = Sandbox(name=label or None, owner=own or None, host=host)
         if not label:
             sb.name = cname  # anonymous: its random container name is all there is
         sb._running = state == "running"
+        sb.created = datetime.strptime(created.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")  # "... +0000 UTC": drop the zone name
         boxes.append(sb)
     return boxes
 
@@ -233,6 +256,7 @@ def create_sandbox(
     lifetime: int | None = None,
     idle_ttl: int | None = None,
     name: str | None = None,
+    owner: str | None = None,
     host: str | None = None,
     runtime: str = "runsc",
 ) -> Sandbox:
@@ -248,8 +272,13 @@ def create_sandbox(
               create_sandbox(name=same) later gets them back: it re-attaches to the container if an earlier
               session left it running (processes and installed packages intact), else makes a fresh one on the
               same volume. sb.delete() erases the data. Default: anonymous, nothing is kept.
-              There is NO ownership check: anyone who passes the same name gets that sandbox, so namespace
-              names per tenant yourself. The volume has no size cap either (limits.disk covers the rest).
+              Without owner= there is NO ownership check: anyone who passes the same name gets that sandbox.
+              The volume has no size cap either (limits.disk covers the rest).
+    owner     A label such as a tenant id (same characters as name). A named sandbox's volume is claimed by the
+              first owner that creates it, and create_sandbox(name=same, owner=other) (or no owner) raises
+              PermissionError instead of re-attaching, restarting or deleting it. list_sandboxes(owner=) lists
+              only theirs. It is a guard against mixing up names, not authentication: whoever can run docker on
+              the host, or build a Sandbox by hand and call delete(), still gets past it.
 
     network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
               docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from
@@ -267,4 +296,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, host=host, runtime=runtime).start()
+                   name=name, owner=owner, host=host, runtime=runtime).start()
