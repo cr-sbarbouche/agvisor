@@ -28,6 +28,12 @@ wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
 
 
+class SandboxGone(RuntimeError):
+    """exec() found the container dead or deleted: killed for going over memory/pids, expired (lifetime/idle_ttl), or
+    removed. It is not a failed command. Named sandboxes: create_sandbox(name=...) again gives a fresh container on
+    the same volume."""
+
+
 class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
@@ -162,8 +168,19 @@ class Sandbox:
         if on_output:
             if input is not None:
                 raise ValueError("on_output can't be combined with input")
-            return self._stream("exec", "-i", self.name, *argv, on_output=on_output)
-        return self._docker("exec", "-i", self.name, *argv, input=input, check=False)
+            r = self._stream("exec", "-i", self.name, *argv, on_output=on_output)
+            msg = r.stdout  # _stream merges stderr into stdout
+        else:
+            r = self._docker("exec", "-i", self.name, *argv, input=input, check=False)
+            msg = r.stderr
+        # ponytail: matches message text. "is not running" and "WaitPID" were seen on a real gVisor VM; "Error response
+        # from daemon" and "No such container" are docker's standard wording, not re-checked there. The prefix is
+        # required for the first two so a command printing "nginx is not running" isn't mistaken for a dead sandbox.
+        msg = msg.lower()
+        if r.returncode in (1, 128) and ("waitpid" in msg or "error response from daemon" in msg
+                                         and ("is not running" in msg or "no such container" in msg)):
+            raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
+        return r
 
     def desktop_token(self, key: bytes, ttl=300):
         """Token for <agvisor-desktop>. Mint it server-side only: it carries the RDP password.

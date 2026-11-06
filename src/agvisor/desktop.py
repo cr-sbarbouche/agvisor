@@ -7,7 +7,7 @@ import time
 
 GUI_IMAGE = "systemd-debian-gnome"  # built from the gVisor repo, see README
 GUI_USER = "gnome"
-GUI_HOME = f"/home/{GUI_USER}"  # persisted for named gui sandboxes (assumed home of GUI_USER: verify on the image)
+GUI_HOME = f"/home/{GUI_USER}"  # the image's home of GUI_USER (RDP credentials are read from it); persisted for named gui sandboxes
 RDP_PORT = 3389
 
 

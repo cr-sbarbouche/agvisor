@@ -1,14 +1,28 @@
 [project]
 name = "agvisor"
-version = "0.1.0"
+version = "0.1.1"
 description = "gVisor sandboxes for coding agents, with resource limits and optional GUI"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Sadok Barbouche" }]
 requires-python = ">=3.12"
-classifiers = ["Development Status :: 3 - Alpha"]  # PyPI badge; the README says what "alpha" means here (Security section)
+keywords = ["gvisor", "runsc", "sandbox", "docker", "ai-agents", "code-execution"]
+classifiers = [
+    "Development Status :: 3 - Alpha",  # PyPI badge; the README says what "alpha" means here (Security section)
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/cr-sbarbouche/agvisor"
+Issues = "https://github.com/cr-sbarbouche/agvisor/issues"
+Security = "https://github.com/cr-sbarbouche/agvisor/blob/main/SECURITY.md"
+Changelog = "https://github.com/cr-sbarbouche/agvisor/releases"
 
 [project.optional-dependencies]
 web = ["cryptography>=42"]  # only for Sandbox.desktop_token()
