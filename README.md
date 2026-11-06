@@ -162,5 +162,6 @@ To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening 
 - `.github/workflows/ci.yml` runs on every PR, every push to `main`, and weekly (new advisories appear without commits):
   `test` (Python tests, the gateway token round trip, and the component in real Chrome), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows).
 - `.github/dependabot.yml` opens weekly update PRs for `uv`, `npm` and the GitHub Actions themselves (minor+patch grouped, 7-day cooldown). Those PRs run the same checks.
+- `.github/workflows/publish-npm.yml` publishes `web/` (`agvisor-desktop`) to npm with Trusted Publishing: push a tag `web-vX.Y.Z` that equals the version in `web/package.json` and is on `main`. Run by hand, it only builds, tests and lists the package. Setup steps are at the top of the file.
 - Not configurable from a workflow, set these in the repo settings: make `test`, `audit` and `semgrep` required checks on `main`, and turn on Dependabot alerts.
 - Run it locally: `uv run python tests/test_args.py`, then in `web/`: `npm test` and `npm run test:browser` (after `npm ci` in both `web/` and `gateway/`), plus `uvx pip-audit …`, `uvx semgrep …` (exact commands in `ci.yml`).
