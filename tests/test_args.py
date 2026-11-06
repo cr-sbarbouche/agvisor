@@ -3,7 +3,7 @@ import subprocess
 import threading
 from unittest import mock
 
-from agvisor import Limits, Sandbox
+from agvisor import Limits, Sandbox, SandboxGone
 from agvisor.sandbox import _RDP_SETUP, create_sandbox, list_sandboxes
 
 
@@ -196,6 +196,32 @@ def test_list_sandboxes():
     assert calls[-1][1:] == ["rm", "-f", "agvisor-ab12cd34"]
 
 
+def test_exec_raises_when_the_sandbox_is_gone():
+    sb = Sandbox()
+    gone = ["Error response from daemon: container 1a2b is not running",
+            "Error response from daemon: No such container: agvisor-x",  # --rm deleted it after lifetime/idle_ttl
+            "OCI runtime exec failed: containerManager.WaitPID: EOF"]
+    for rc, err in [(1, gone[0]), (1, gone[1]), (128, gone[2])]:
+        sb._docker = lambda *a, rc=rc, err=err, **_: subprocess.CompletedProcess(a, rc, "", err)
+        try:
+            sb.exec("ls")
+        except SandboxGone:
+            continue
+        raise AssertionError(f"rc={rc} {err!r} must raise SandboxGone")
+    sb._stream = lambda *a, **_: subprocess.CompletedProcess(a, 1, gone[1], "")  # streaming merges stderr into stdout
+    try:
+        sb.exec("ls", on_output=print)
+    except SandboxGone:
+        pass
+    else:
+        raise AssertionError("streaming exec must raise SandboxGone too")
+    # real command failures are returned, not raised: exit 1, a command's own "is not running", a dead-looking stdout
+    for rc, out, err in [(1, "", "grep: x: No such file"), (1, "", "nginx is not running"), (0, "Error response from daemon: No such container", ""),
+                         (3, "", gone[0]), (1, gone[0], "")]:
+        sb._docker = lambda *a, rc=rc, out=out, err=err, **_: subprocess.CompletedProcess(a, rc, out, err)
+        assert sb.exec("ls").returncode == rc
+
+
 def test_exec_streams_output():
     r, w = os.pipe()
     first, got = threading.Event(), []
@@ -239,5 +265,6 @@ if __name__ == "__main__":
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()
+    test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     print("ok")

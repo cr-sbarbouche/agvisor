@@ -1,5 +1,7 @@
 # agvisor
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/agvisor?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/agvisor)
+
 gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids limits, optional GNOME desktop over RDP.
 
 > **Alpha, and not security-audited.** Read [Security](#security) before running code you don't trust.
@@ -67,7 +69,7 @@ sb.stop()                                      # without `with`, you stop it you
 
 Under gVisor, the limits behave differently from plain docker (checked on real `runsc`):
 - `pids` budgets the sandbox runtime's *host threads*, not guest processes: an idle sandbox already uses ~35. Keep the default (512): at 64–128, a fork storm made `fork` fail with `Out of memory` and, pushed harder, killed the sandbox.
-- Going over `memory` or `pids` kills the **whole sandbox**, not one process, and the host doesn't notice. Afterwards `exec` returns `returncode` 1 or 128 with `is not running` or `WaitPID` in stderr. Call `create_sandbox(name=...)` again: it starts a fresh container on the same `/workspace` volume.
+- Going over `memory` or `pids` kills the **whole sandbox**, not one process, and the host doesn't notice. Afterwards `exec()` raises `SandboxGone` (it also does once `lifetime` or `idle_ttl` has deleted the container), so a dead sandbox isn't mistaken for a failed command: it recognises docker's and runsc's error text and only looks at exit codes 1 and 128. Call `create_sandbox(name=...)` again: it starts a fresh container on the same `/workspace` volume.
 - `disk` caps the **root filesystem** (runsc's `overlay2` annotation, checked on release-20261026.0): past it, writes fail with `No space left on device` and the sandbox keeps running. Whole number + `k/m/g/t`: `1.5g` and `2gb` are rejected. It does **not** cover `/tmp`, which gVisor backs with RAM (counted in `memory`), nor the `/workspace` volume of a named sandbox: that is a plain host directory with **no size cap**, so a runaway agent can fill the host's disk through it. Until that has a cap, keep `/var/lib/docker` on a disk of its own, and don't share it with anything you care about. `tests/test_gvisor_disk.py` checks the cap against real gVisor.
 - Inside, `uname -r` reports `4.19.0-gvisor` and `/sys/fs/cgroup` and `/sys/class/net` don't exist (use `/proc/net/dev`).
 
@@ -126,10 +128,10 @@ token = sb.desktop_token(bytes.fromhex(os.environ["AGVISOR_KEY"]), ttl=60)  # se
 # return {"gateway": "wss://your.host/desktop", "token": token} to the page
 ```
 
-In the page, give the element a size and pass both values (the component is `web/`, npm package `agvisor-desktop`):
+In the page, give the element a size and pass both values. The component is [`web/agvisor-desktop.js`](web/agvisor-desktop.js); it is **not on npm yet**, so copy that one file into your app and `npm install guacamole-common-js` (its only dependency):
 
 ```jsx
-import "agvisor-desktop";   // React / Next.js ('use client'): safe to import during SSR, it does nothing on the server
+import "./agvisor-desktop.js";   // React / Next.js ('use client'): safe to import during SSR, it does nothing on the server
 <agvisor-desktop gateway={gateway} token={token} style={{ width: "100%", height: 600 }} />
 ```
 
