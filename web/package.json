@@ -2,6 +2,16 @@
   "name": "agvisor-desktop",
   "version": "0.1.0",
   "description": "<agvisor-desktop> web component: view an agvisor GUI sandbox in the browser",
+  "license": "MIT",
+  "author": "Sadok Barbouche",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cr-sbarbouche/agvisor.git",
+    "directory": "web"
+  },
+  "homepage": "https://github.com/cr-sbarbouche/agvisor#gui-in-a-web-page-react-nextjs-vue-plain-html",
+  "bugs": "https://github.com/cr-sbarbouche/agvisor/issues",
+  "keywords": ["web-component", "rdp", "guacamole", "gvisor", "sandbox", "ai-agents"],
   "type": "module",
   "main": "agvisor-desktop.js",
   "exports": {
