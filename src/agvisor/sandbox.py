@@ -11,6 +11,7 @@ from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}"  # name= and owner=: they end up in --name, --volume and --label
+_TAG = r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}"  # snapshot tag: no '.', so a snapshot's volume name splits unambiguously into name.tag
 _KEEP = 100_000  # exec(on_output=) keeps only this many trailing characters: the rest already went to on_output
 _MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
 # gui: RDP checks GNOME Remote Desktop's own credentials file, which the image bakes as gnome:gnome, NOT the unix
@@ -214,10 +215,50 @@ class Sandbox:
         self._running = False
 
     def delete(self):
-        """stop() and also erase the persistent data, so create_sandbox(name=...) starts from scratch."""
+        """stop() and also erase the persistent data and its snapshots, so create_sandbox(name=...) starts from scratch."""
         self.stop()
         if self.persistent:
-            self._docker("volume", "rm", "-f", self.name, check=False)
+            snaps = self._docker("volume", "ls", "-q", "--filter", f"label=agvisor.snap={self.name}", check=False).stdout.split()
+            self._docker("volume", "rm", "-f", self.name, *snaps, check=False)
+
+    def _snap_volume(self, tag):
+        if not self.persistent:
+            raise ValueError("snapshots need a named sandbox: create_sandbox(name=...)")
+        if not re.fullmatch(_TAG, tag):
+            raise ValueError(f"invalid snapshot tag {tag!r}: letters, digits, '_', '-' only (max 32)")
+        return f"agvisor_snap_{self.name.removeprefix('agvisor-')}.{tag}"  # '_' after 'agvisor': no sandbox volume is called that
+
+    def _copy(self, src, dst):
+        """Make volume `dst` an exact copy of volume `src`, in a throwaway gVisor container (hostile files never meet a
+        host-side cp). Needs sh, rm and cp in the sandbox's image."""
+        self._docker("run", "--rm", f"--runtime={self.runtime}", "--network=none", f"--memory={self.limits.memory}",
+                     "--user=0", "--entrypoint=sh", f"--volume={src}:/from:ro", f"--volume={dst}:/to", self.image,
+                     "-c", "set -e; rm -rf /to/* /to/.[!.]* /to/..?*; cp -a /from/. /to/")
+
+    def snapshot(self, tag):
+        """Save a copy of the data dir (/workspace) as `tag`, replacing a snapshot of that name. Named sandboxes only.
+        Kept until delete(). Costs as much disk as the data dir, uncapped like it. Stop writing first: a copy taken
+        while something writes can be inconsistent."""
+        snap = self._snap_volume(tag)
+        self._claim_volume()  # also makes sure the volume exists: `docker run -v` would silently create an empty one
+        self._docker("volume", "create", f"--label=agvisor.snap={self.name}", snap)
+        try:
+            self._copy(self.name, snap)
+        except BaseException:
+            self._docker("volume", "rm", "-f", snap, check=False)  # a half-copied snapshot must not be restorable
+            raise
+
+    def restore(self, tag):
+        """Put the data dir back to snapshot `tag`: whatever is in it now is erased. The container is replaced by a
+        fresh one (processes lost), so a bad install is gone from both /workspace and everything else. Returns self.
+        If the copy fails the sandbox stays stopped and the data dir is partial: call restore() again, the snapshot is intact."""
+        snap = self._snap_volume(tag)
+        if self._docker("volume", "inspect", snap, check=False).returncode:  # `run -v` would make an empty one and wipe the data dir with it
+            raise ValueError(f"no snapshot {tag!r} of {self.name}")
+        self._claim_volume()
+        self.stop()
+        self._copy(snap, self.name)
+        return self.start()
 
     def __enter__(self):
         return self.start()
