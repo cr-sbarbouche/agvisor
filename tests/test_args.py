@@ -300,6 +300,49 @@ def test_exec_streams_output():
     raise AssertionError("accepted stdin together with on_output")
 
 
+def test_mcp_server():
+    from agvisor import mcp_server as m
+
+    class Fake:  # stands in for a Sandbox
+        idle_ttl = 30
+
+        def __init__(self, gone):
+            self.gone, self.calls, self.stopped = gone, [], False
+
+        def exec(self, cmd, *, timeout, on_output):
+            self.calls.append((cmd, timeout))
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            return subprocess.CompletedProcess([], 3, "out\n", "")
+
+        def stop(self):
+            self.stopped = True
+
+    boxes, kws = [], []
+
+    def create(*a, **kw):
+        kws.append(kw)
+        boxes.append(Fake(gone=len(boxes) == 1))  # the second sandbox dies on its first command
+        return boxes[-1]
+
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", create), \
+            mock.patch.dict(os.environ, {"AGVISOR_IDLE_TTL": "30", "AGVISOR_HOST": "ssh://u@vm"}):
+        assert m.run("echo hi", timeout=999) == "out\n\n[exit 3]"
+        # the agent gets no say in these: network off, host and limits from the environment, hard lifetime cap
+        assert (kws[0]["network"], kws[0]["host"], kws[0]["idle_ttl"], kws[0]["lifetime"]) == ("none", "ssh://u@vm", 30, 3600)
+        assert kws[0]["limits"] == Limits(cpus=2, memory="2g")
+        assert boxes[0].calls == [("echo hi", 23)]  # exec() refuses timeout >= idle_ttl - 6: clamped to idle_ttl - 7
+        m.run("again")
+        assert len(boxes) == 1  # reused, not recreated
+        m.reset()
+        assert boxes[0].stopped and m._sb is None
+        msg = m.run("x")  # sandbox 2 is dead: the agent is told, nothing is silently re-run
+        assert msg.startswith("sandbox was reset") and boxes[1].stopped and m._sb is None and len(boxes) == 2
+        assert m.run("y").endswith("[exit 3]") and len(boxes) == 3  # the next call gets a fresh one
+    m._sb = None
+
+
 if __name__ == "__main__":
     test_headless()
     test_gui_start()
@@ -316,4 +359,5 @@ if __name__ == "__main__":
     test_owner()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
+    test_mcp_server()
     print("ok")

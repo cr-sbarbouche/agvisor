@@ -117,6 +117,43 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 - `sb.created` is a timezone-aware `datetime` (second precision) of when the container was made, so a retention job can stop what is older than it should be: `[sb.stop() for sb in list_sandboxes() if now - sb.created > max_age]`. Sandboxes from `create_sandbox()` have `created = None`.
 - `owner=` tags a sandbox, e.g. with a tenant id: `create_sandbox(name="u42-scan7", owner="u42")`, and `list_sandboxes(owner="u42")` lists only theirs. See the `name=` note under Security for what it does and doesn't protect.
 
+## Coding agents (skill + MCP server)
+
+Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
+
+- **Skill**, [`.claude/skills/agvisor/SKILL.md`](.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
+- **MCP server**, `agvisor-mcp`: two tools, `run(command, timeout)` and `reset()`, so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
+
+Settings are environment variables, so the agent can't pick its own image, network or limits:
+
+| variable | default |
+|---|---|
+| `AGVISOR_HOST` | local docker / `$DOCKER_HOST`; `ssh://user@vm` for a remote Linux host |
+| `AGVISOR_NETWORK` | `none` (no internet: `pip install` fails). `bridge` for internet |
+| `AGVISOR_IMAGE` | `ubuntu:24.04` |
+| `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
+| `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
+
+The sandbox is anonymous: no `/workspace` volume, so nothing is shared between projects, and the sandbox can't see your files (the agent writes code in with a heredoc). Claude Code:
+
+```sh
+claude mcp add agvisor -e AGVISOR_HOST=ssh://user@my-vm -- uvx --from 'agvisor[mcp]' agvisor-mcp
+```
+
+VS Code, `.vscode/mcp.json`:
+
+```json
+{"servers": {"agvisor": {"type": "stdio", "command": "uvx", "args": ["--from", "agvisor[mcp]", "agvisor-mcp"],
+                         "env": {"AGVISOR_HOST": "ssh://user@my-vm"}}}}
+```
+
+OpenCode, `opencode.json`:
+
+```json
+{"mcp": {"servers": {"agvisor": {"type": "local", "command": ["uvx", "--from", "agvisor[mcp]", "agvisor-mcp"],
+                                 "environment": {"AGVISOR_HOST": "ssh://user@my-vm"}}}}}
+```
+
 ## GUI in a web page (React, Next.js, Vue, plain HTML)
 
 Browsers can't speak RDP, so there is a gateway in between: `browser <-wss-> gateway/gateway.js <-> guacd <-RDP-> sandbox`.

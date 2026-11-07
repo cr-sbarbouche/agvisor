@@ -63,9 +63,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      - name: pip-audit (runtime deps + the web extra, exactly as locked)
+      - name: pip-audit (runtime deps + the web and mcp extras, exactly as locked)
         run: |
-          uv export --locked --no-dev --extra web --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
+          uv export --locked --no-dev --extra web --extra mcp --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
           uvx "pip-audit==$PIP_AUDIT_VERSION" -r "$RUNNER_TEMP/requirements.txt" --disable-pip --no-deps --strict
       - name: npm audit (the browser component and the gateway, dev dependencies included)
         run: |
