@@ -2,6 +2,7 @@ import os
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 from agvisor import Limits, Sandbox, SandboxGone
@@ -343,6 +344,21 @@ def test_mcp_server():
     m._sb = None
 
 
+def test_skill_frontmatter_is_strict_yaml():
+    # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
+    path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
+    if not path.exists():  # the sdist ships tests/ but not .claude/
+        return
+    front = path.read_text().split("---")[1]
+    for line in front.strip().splitlines():
+        _, _, val = line.partition(": ")
+        if val.startswith(('"', "'")):
+            assert val[-1] == val[0] and val[0] not in val[1:-1], f"unclosed or nested quote: {line}"
+        else:
+            assert ": " not in val and " #" not in val, f"quote this value, a bare ': ' or ' #' breaks YAML: {line}"
+    assert "\nname: agvisor\n" in front  # VS Code: `name` must equal the skill's directory name
+
+
 if __name__ == "__main__":
     test_headless()
     test_gui_start()
@@ -360,4 +376,5 @@ if __name__ == "__main__":
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     test_mcp_server()
+    test_skill_frontmatter_is_strict_yaml()
     print("ok")

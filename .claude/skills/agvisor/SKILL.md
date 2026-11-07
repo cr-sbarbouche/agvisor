@@ -1,6 +1,6 @@
 ---
 name: agvisor
-description: Run untrusted or risky code in a gVisor sandbox instead of on the host: unknown scripts, `pip install` of unvetted packages, anything that needs CPU/memory limits. Use when the user asks to sandbox, isolate, or safely run code.
+description: "Run untrusted or risky code in a gVisor sandbox instead of on the host, such as unknown scripts, `pip install` of unvetted packages, or anything that needs CPU/memory limits. Use when the user asks to sandbox, isolate, or safely run code."
 ---
 
 # agvisor
