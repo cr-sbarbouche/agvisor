@@ -141,13 +141,78 @@ def test_resume_and_delete():
         sb = create_sandbox(name="proj")
         sb.delete()
     assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["inspect", "-f"], ["rm", "-f"],
-                                       ["run", "-d"], ["rm", "-f"], ["volume", "rm"]]
+                                       ["run", "-d"], ["rm", "-f"], ["volume", "ls"], ["volume", "rm"]]
+    assert calls[-2][1:] == ["volume", "ls", "-q", "--filter", "label=agvisor.snap=agvisor-proj"]  # its snapshots go too
     assert calls[-1][1:] == ["volume", "rm", "-f", "agvisor-proj"]
 
     calls, run = fake_docker(inspect_out="true\n")  # left running: re-attach, never docker run
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         sb = create_sandbox(name="proj")
     assert [c[1] for c in calls] == ["volume", "volume", "inspect"] and sb._running
+
+
+def test_snapshot_and_restore():
+    snap = "agvisor_snap_proj.clean"
+    calls, run = fake_docker(inspect_out="false\n")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        sb = create_sandbox(name="proj")
+        calls.clear()
+        sb.snapshot("clean")
+        assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["volume", "create"], ["run", "--rm"]]
+        assert calls[2][2:] == ["create", "--label=agvisor.snap=agvisor-proj", snap]  # delete() finds it by this label
+        cp = calls[-1]
+        assert "--network=none" in cp and "--runtime=runsc" in cp and f"--volume=agvisor-proj:/from:ro" in cp
+        assert f"--volume={snap}:/to" in cp  # the source is read-only, only the copy is written
+
+        calls.clear()
+        assert sb.restore("clean") is sb and sb._running
+        steps = [c[1:3] for c in calls]
+        assert steps.index(["rm", "-f"]) < steps.index(["run", "--rm"]) < steps.index(["run", "-d"])  # stop, copy, fresh container
+        cp = calls[steps.index(["run", "--rm"])]
+        assert f"--volume={snap}:/from:ro" in cp and "--volume=agvisor-proj:/to" in cp  # the other way round
+
+    calls, run = fake_docker(fail=(snap,))  # no such snapshot: must not wipe the data dir with an empty volume
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            Sandbox(name="proj").restore("clean")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("restored a snapshot that does not exist")
+    assert not any(c[1] in ("run", "rm") for c in calls)
+
+    calls, run = fake_docker(fail=("--rm",))  # the copy dies (disk full): no half-copied snapshot is left to restore from
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            Sandbox(name="proj").snapshot("clean")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("swallowed a failed copy")
+    assert calls[-1][1:] == ["volume", "rm", "-f", snap]
+
+    calls, run = fake_docker(volume_owner="u42")  # another owner: refused before anything is copied or wiped
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        for act in ("snapshot", "restore"):
+            try:
+                getattr(Sandbox(name="proj", owner="other"), act)("clean")
+            except PermissionError:
+                continue
+            raise AssertionError(f"{act} ignored the owner")
+    assert not any(c[1] in ("run", "rm") for c in calls)
+
+    for act in ("snapshot", "restore"):  # anonymous: no volume to snapshot
+        try:
+            getattr(Sandbox(), act)("clean")
+        except ValueError:
+            continue
+        raise AssertionError(f"anonymous sandbox {act}d")
+    for tag in ("", "-x", "a.b", "a b", "a:/etc", "x" * 33):  # ends up in a volume name
+        try:
+            Sandbox(name="proj").snapshot(tag)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted tag {tag!r}")
 
 
 def test_failed_resume_keeps_the_container():
@@ -369,6 +434,7 @@ if __name__ == "__main__":
     test_lifetime_and_validation()
     test_named_sandbox_mounts_volume()
     test_resume_and_delete()
+    test_snapshot_and_restore()
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()

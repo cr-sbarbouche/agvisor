@@ -93,6 +93,20 @@ with create_sandbox("python:3.12", name="my-project") as sb:   # session 2, days
 create_sandbox(name="my-project").delete()          # forget it: erases the data too
 ```
 
+To undo a bad install that landed in `/workspace`, save a known-good state and go back to it:
+
+```python
+with create_sandbox("python:3.12", name="my-project") as sb:
+    sb.exec("python -m venv .venv && .venv/bin/pip install -r requirements.txt")
+    sb.snapshot("clean")                            # copies /workspace into a second volume
+    sb.exec(".venv/bin/pip install some-sketchy-package")
+    sb.restore("clean")                             # /workspace is exactly as it was; new container, processes lost
+```
+
+- `snapshot(tag)` replaces a snapshot of the same tag; `restore(tag)` erases whatever is in the data dir now. `delete()` removes the snapshots with the sandbox. Tags: letters, digits, `_`, `-`.
+- Named sandboxes only, and the owner check applies. The copy runs in a throwaway gVisor container from the sandbox's image (it needs `sh`, `rm`, `cp`), with no network.
+- Each snapshot costs as much host disk as the data dir, and has no size cap either. Stop writing before `snapshot()`: a copy taken during writes can be inconsistent.
+
 - **Kept:** everything under `sb.data_dir` (`/workspace`; the `gnome` home for `gui=True`), in a docker volume `agvisor-<name>`.
 - **Not kept:** processes, and anything outside `data_dir` (e.g. `apt install`): gVisor discards the rootfs overlay when the container is destroyed. Work in `/workspace` (venvs, repos, caches), or bake system packages into your image.
 - **Keep everything:** don't call `stop()`. The container stays running and the next `create_sandbox(name=...)` re-attaches to it with processes and installed packages intact. (`limits`/`image` are then ignored: they were fixed at creation.)
