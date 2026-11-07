@@ -1,11 +1,14 @@
+import { useState } from 'react';
 import {
   ArrowDown,
   ArrowUpRight,
+  BookOpen,
   Clock3,
   Code2,
   Github,
   Layers3,
   Monitor,
+  Plug,
   Terminal,
 } from 'lucide-react';
 import logo from './assets/logo.jpeg';
@@ -15,6 +18,80 @@ import videoPoster from './assets/video-poster.jpg';
 const repository = 'https://github.com/cr-sbarbouche/agvisor';
 const linkedinPost =
   'https://www.linkedin.com/feed/update/urn:li:activity:7524033443815641088/';
+
+// Same lines as the README's "Coding agents" section. cmd = shell command, cont = its continuation, json = config, note = comment.
+type Line = ['cmd' | 'cont' | 'json' | 'note', string];
+const setups: { id: string; label: string; file: string; lines: Line[] }[] = [
+  {
+    id: 'claude',
+    label: 'Claude Code',
+    file: 'terminal',
+    lines: [
+      ['cmd', "claude mcp add agvisor -e AGVISOR_HOST=ssh://user@my-vm \\"],
+      ['cont', "  -- uvx --from 'agvisor[mcp]' agvisor-mcp"],
+      ['note', '# the skill: copy the folder from the repo'],
+      ['cmd', 'cp -r .claude/skills/agvisor ~/.claude/skills/'],
+    ],
+  },
+  {
+    id: 'vscode',
+    label: 'VS Code',
+    file: '.vscode/mcp.json',
+    lines: [
+      ['json', '{"servers": {"agvisor": {'],
+      ['json', '  "type": "stdio", "command": "uvx",'],
+      ['json', '  "args": ["--from", "agvisor[mcp]", "agvisor-mcp"],'],
+      ['json', '  "env": {"AGVISOR_HOST": "ssh://user@my-vm"}}}}'],
+      ['note', '# the skill: .github/skills/agvisor/ or .claude/skills/agvisor/'],
+    ],
+  },
+  {
+    id: 'opencode',
+    label: 'OpenCode',
+    file: 'opencode.json',
+    lines: [
+      ['json', '{"mcp": {"servers": {"agvisor": {'],
+      ['json', '  "type": "local",'],
+      ['json', '  "command": ["uvx", "--from", "agvisor[mcp]", "agvisor-mcp"],'],
+      ['json', '  "environment": {"AGVISOR_HOST": "ssh://user@my-vm"}}}}}'],
+      ['note', '# the skill: .opencode/skills/agvisor/ or .claude/skills/agvisor/'],
+    ],
+  },
+];
+
+function AgentSetup() {
+  const [active, setActive] = useState(0);
+  const setup = setups[active];
+  return (
+    <div className="code-window" role="region" aria-label="Agent setup">
+      <div className="code-bar"><i /><i /><i /><span>{setup.file}</span></div>
+      <div className="setup-tabs" role="tablist" aria-label="Agent client">
+        {setups.map((s, i) => (
+          <button
+            key={s.id}
+            type="button"
+            role="tab"
+            aria-selected={i === active}
+            className={i === active ? 'is-active' : undefined}
+            onClick={() => setActive(i)}
+            data-testid={`tab-setup-${s.id}`}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+      <pre>
+        {setup.lines.map(([kind, text], i) => (
+          <span key={i}>
+            {kind === 'cmd' && <span className="code-muted">$ </span>}
+            <span className={kind === 'note' ? 'code-muted' : kind === 'json' ? 'code-blue' : 'code-gold'}>{text}</span>
+            {'\n'}
+          </span>
+        ))}
+      </pre>
+    </div>
+  );
+}
 
 function Home() {
   return (
@@ -27,6 +104,7 @@ function Home() {
           </a>
           <nav className="nav-links" aria-label="Product">
             <a href="#features" data-testid="link-features">What it does</a>
+            <a href="#agents" data-testid="link-agents">For agents</a>
             <a href="#quickstart" data-testid="link-quickstart">Quickstart</a>
             <a className="nav-cta" href={repository} target="_blank" rel="noreferrer" data-testid="link-github-nav">
               <Github size={15} aria-hidden="true" /> GitHub <ArrowUpRight size={13} aria-hidden="true" />
@@ -39,7 +117,7 @@ function Home() {
             <div className="eyebrow reveal"><span className="eyebrow-dot" /> Python · Docker · gVisor</div>
             <h1 className="display reveal delay-1" id="hero-title">Run agent code in<br /><span>bounded sandboxes.</span></h1>
             <p className="hero-copy reveal delay-2">
-              Agvisor is a small Python library for creating and managing Docker-backed sandboxes for coding-agent workflows, using gVisor’s runsc runtime.
+              Agvisor is a small Python library for creating and managing Docker-backed sandboxes for coding-agent workflows, using gVisor’s runsc runtime. It also ships an MCP server and an agent skill for Claude Code, VS Code and OpenCode.
             </p>
             <div className="hero-actions reveal delay-2">
               <a className="button button-primary" href={repository} target="_blank" rel="noreferrer" data-testid="link-github-hero">
@@ -96,7 +174,7 @@ function Home() {
             <article className="feature-panel">
               <div className="feature-icon"><Layers3 size={20} aria-hidden="true" /></div>
               <h3>Named and resumable</h3>
-              <p>Give sandboxes names and resume them across steps. List, stop, delete, or execute commands inside them.</p>
+              <p>Give sandboxes a name and an owner, and resume them across steps. List them with their creation time, then stop, delete, or execute commands inside them.</p>
             </article>
             <article className="feature-panel">
               <div className="feature-icon"><Clock3 size={20} aria-hidden="true" /></div>
@@ -130,6 +208,49 @@ function Home() {
               <h3>Continue or clean up</h3>
               <p>Run commands, resume named sandboxes, then stop or delete when the work is done.</p>
             </article>
+          </div>
+        </section>
+
+        <section className="section section-tint" id="agents" aria-labelledby="agents-title">
+          <div className="section-head">
+            <div>
+              <div className="section-kicker">For coding agents</div>
+              <h2 id="agents-title">Give your agent a sandbox, not your shell.</h2>
+            </div>
+            <p className="section-intro">
+              A skill tells the agent when to sandbox and what trips people up. An MCP server gives it the tools, with the host, network and limits set by you. Turn off the agent’s own shell tool and it has nowhere else to run code.
+            </p>
+          </div>
+          <div className="feature-layout">
+            <article className="feature-panel feature-wide">
+              <span className="feature-index">01 / MCP SERVER</span>
+              <h3>Guardrails the agent can’t change.</h3>
+              <p>Two tools, <code>run</code> and <code>reset</code>. Image, network and limits come from environment variables you set, so the agent can’t ask for more. Network is off by default.</p>
+              <div className="limit-list" aria-label="Settings the MCP server reads">
+                <span>Host</span><span>Network</span><span>Image</span><span>CPU</span><span>Memory</span><span>Idle TTL</span><span>Lifetime</span>
+              </div>
+            </article>
+            <article className="feature-panel">
+              <div className="feature-icon"><BookOpen size={20} aria-hidden="true" /></div>
+              <h3>A skill for the when and how</h3>
+              <p>One <code>SKILL.md</code> covers the gotchas: which images work, why <code>pids</code> stays at 512, what <code>SandboxGone</code> means. Claude Code, VS Code and OpenCode all read it.</p>
+            </article>
+            <article className="feature-panel">
+              <div className="feature-icon"><Plug size={20} aria-hidden="true" /></div>
+              <h3>Disposable by default</h3>
+              <p>The sandbox is anonymous and deletes itself after 10 idle minutes or an hour, whichever comes first. It can’t see your files, and nothing is shared between projects.</p>
+            </article>
+          </div>
+          <div className="code-section" style={{ marginTop: 34 }}>
+            <div>
+              <div className="section-kicker">Add it to your agent</div>
+              <h3 className="setup-title">Three clients, one setup.</h3>
+              <p>The server runs with <code>uvx</code> and the skill is a plain folder all three read. Point <code>AGVISOR_HOST</code> at a Linux host with gVisor: macOS can’t run <code>runsc</code>.</p>
+              <a className="button button-primary" style={{ marginTop: 18 }} href={`${repository}#coding-agents-skill--mcp-server`} target="_blank" rel="noreferrer" data-testid="link-agents-readme">
+                Full setup in the README <ArrowUpRight size={15} aria-hidden="true" />
+              </a>
+            </div>
+            <AgentSetup />
           </div>
         </section>
 
@@ -176,7 +297,7 @@ function Home() {
             </div>
             <div className="code-window" role="region" aria-label="Installation command">
               <div className="code-bar"><i /><i /><i /><span>terminal</span></div>
-              <pre><span className="code-muted">$</span> <span className="code-gold">pip install agvisor</span>{'\n'}<span className="code-muted"># Python library · Docker CLI · gVisor runsc</span></pre>
+              <pre><span className="code-muted">$</span> <span className="code-gold">pip install agvisor</span>{'\n'}<span className="code-muted"># Python library · Docker CLI · gVisor runsc</span>{'\n'}<span className="code-muted">$</span> <span className="code-gold">pip install 'agvisor[mcp]'</span>{'\n'}<span className="code-muted"># adds agvisor-mcp, the MCP server for coding agents</span></pre>
             </div>
           </div>
           <div className="feature-layout" style={{ marginTop: 34 }}>
