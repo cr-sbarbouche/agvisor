@@ -121,7 +121,7 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
 
-- **Skill**, [`.claude/skills/agvisor/SKILL.md`](.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
+- **Skill**, [`.claude/skills/agvisor/SKILL.md`](https://github.com/cr-sbarbouche/agvisor/blob/main/.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
 - **MCP server**, `agvisor-mcp`: two tools, `run(command, timeout)` and `reset()`, so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
 
 Settings are environment variables, so the agent can't pick its own image, network or limits:
@@ -174,7 +174,7 @@ token = sb.desktop_token(bytes.fromhex(os.environ["AGVISOR_KEY"]), ttl=60)  # se
 # return {"gateway": "wss://your.host/desktop", "token": token} to the page
 ```
 
-In the page, give the element a size and pass both values. The component is the npm package [`agvisor-desktop`](https://www.npmjs.com/package/agvisor-desktop) (source in [`web/`](web/); its only dependency is `guacamole-common-js`, installed with it):
+In the page, give the element a size and pass both values. The component is the npm package [`agvisor-desktop`](https://www.npmjs.com/package/agvisor-desktop) (source in [`web/`](https://github.com/cr-sbarbouche/agvisor/tree/main/web); its only dependency is `guacamole-common-js`, installed with it):
 
 ```sh
 npm install agvisor-desktop
