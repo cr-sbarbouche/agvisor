@@ -114,6 +114,9 @@ class Sandbox:
             a.append(f"--shm-size={l.shm}")
         if not self.gui:  # PID 1 is `sleep`, which never reaps orphans: they stay zombies and eat the pids limit
             a.append("--init")  # (gui: systemd is PID 1 and reaps)
+            # an image ENTRYPOINT would swallow our PID 1 command as its arguments. exec() bypasses it anyway, so
+            # clearing it loses nothing but the entrypoint's own setup script
+            a.append("--entrypoint=")
         return a + [self.image] + self._pid1()
 
     def _pid1(self):
@@ -247,6 +250,19 @@ class Sandbox:
         except BaseException:
             self._docker("volume", "rm", "-f", snap, check=False)  # a half-copied snapshot must not be restorable
             raise
+
+    def list_snapshots(self):
+        """Tags of this sandbox's snapshots, sorted. Named sandboxes only; the owner check applies."""
+        prefix = self._snap_volume("x").removesuffix("x")  # validates persistence, and gives the volume-name prefix
+        self._claim_volume()
+        vols = self._docker("volume", "ls", "-q", "--filter", f"label=agvisor.snap={self.name}").stdout.split()
+        return sorted(v.removeprefix(prefix) for v in vols)
+
+    def delete_snapshot(self, tag):
+        """Remove snapshot `tag` and free its disk. Not an error if it doesn't exist."""
+        snap = self._snap_volume(tag)
+        self._claim_volume()
+        self._docker("volume", "rm", "-f", snap)
 
     def restore(self, tag):
         """Put the data dir back to snapshot `tag`: whatever is in it now is erased. The container is replaced by a

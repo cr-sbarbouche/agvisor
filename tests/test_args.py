@@ -15,6 +15,9 @@ def test_headless():
     assert "--privileged" not in a and a[-2:] == ["sleep", "infinity"]
     assert "--init" in a  # a real PID 1 reaps orphans; `sleep` would leave zombies that eat the pids limit
     assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=5g" in a  # default disk cap
+    assert "--entrypoint=" in a  # an image ENTRYPOINT would take `sleep infinity` as its arguments
+    assert a.index("--entrypoint=") < a.index("ubuntu:24.04")  # a docker flag only works before the image
+    assert not any(x.startswith("--entrypoint") for x in Sandbox(gui=True).run_args())  # systemd image: its own PID 1
     a = Sandbox(limits=Limits(disk="100M"), gui=True).run_args()
     assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=100M" in a  # gui too; root only, never `all:`
 
@@ -105,9 +108,9 @@ def test_lifetime_and_validation():
         raise AssertionError(f"accepted {bad}")
 
 
-def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner=""):
+def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner="", vols=""):
     """Patchable subprocess.run: records commands; `fail` = words that make a command exit 1;
-    `volume_owner` = the agvisor.owner label that `docker volume inspect` reports."""
+    `volume_owner` = the agvisor.owner label that `docker volume inspect` reports; `vols` = `docker volume ls -q`."""
     calls = []
 
     def run(cmd, **_):
@@ -115,6 +118,8 @@ def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner=""):
         out = {"inspect": inspect_out, "port": "127.0.0.1:49153\n", "ps": ps_out}.get(cmd[1], "")
         if cmd[1:3] == ["volume", "inspect"]:
             out = volume_owner + "\n"
+        if cmd[1:3] == ["volume", "ls"]:
+            out = vols
         bad = any(w in cmd for w in fail)
         return subprocess.CompletedProcess(cmd, 1 if bad else 0, out, "boom" if bad else "")
 
@@ -213,6 +218,36 @@ def test_snapshot_and_restore():
         except ValueError:
             continue
         raise AssertionError(f"accepted tag {tag!r}")
+
+
+def test_list_and_delete_snapshot():
+    prefix = "agvisor_snap_proj."
+    calls, run = fake_docker(vols=f"{prefix}b\n{prefix}a-1\n")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        assert Sandbox(name="proj").list_snapshots() == ["a-1", "b"]
+        assert calls[-1][1:] == ["volume", "ls", "-q", "--filter", "label=agvisor.snap=agvisor-proj"]
+        calls.clear()
+        Sandbox(name="proj").delete_snapshot("b")
+        assert calls[-1][1:] == ["volume", "rm", "-f", prefix + "b"]  # -f: deleting one that is already gone is fine
+
+    calls, run = fake_docker(volume_owner="u42")  # another owner: refused, nothing listed or removed
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        for act, args in (("list_snapshots", ()), ("delete_snapshot", ("b",))):
+            try:
+                getattr(Sandbox(name="proj", owner="other"), act)(*args)
+            except PermissionError:
+                continue
+            raise AssertionError(f"{act} ignored the owner")
+    assert not any(c[1:3] in (["volume", "ls"], ["volume", "rm"]) for c in calls)
+
+    # anonymous (no volume), and a tag that would end up in a volume name
+    for sb, act, args in ((Sandbox(), "list_snapshots", ()), (Sandbox(), "delete_snapshot", ("b",)),
+                          (Sandbox(name="proj"), "delete_snapshot", ("a.b",))):
+        try:
+            getattr(sb, act)(*args)
+        except ValueError:
+            continue
+        raise AssertionError(f"{act}{args} was accepted")
 
 
 def test_failed_resume_keeps_the_container():
@@ -384,6 +419,12 @@ def test_mcp_server():
         def stop(self):
             self.stopped = True
 
+        def snapshot(self, tag):
+            self.calls.append(("snapshot", tag))
+
+        def restore(self, tag):
+            self.calls.append(("restore", tag))
+
     boxes, kws = [], []
 
     def create(*a, **kw):
@@ -406,6 +447,17 @@ def test_mcp_server():
         msg = m.run("x")  # sandbox 2 is dead: the agent is told, nothing is silently re-run
         assert msg.startswith("sandbox was reset") and boxes[1].stopped and m._sb is None and len(boxes) == 2
         assert m.run("y").endswith("[exit 3]") and len(boxes) == 3  # the next call gets a fresh one
+        assert kws[0]["name"] is None  # anonymous unless AGVISOR_NAME says otherwise
+    m._sb = None
+
+    # AGVISOR_NAME: a named sandbox, whose /workspace the checkpoint tools save and roll back
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
+        assert m.snapshot() == "checkpoint saved" and kws[0]["name"] == "proj"
+        assert "restarted" in m.restore()
+        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]  # one fixed slot: no tag from the agent
+        m._sb = None
+        assert "Only /workspace is kept" in m.run("x")  # boxes[1] is the one that dies; its files are not all gone
     m._sb = None
 
 
@@ -435,6 +487,7 @@ if __name__ == "__main__":
     test_named_sandbox_mounts_volume()
     test_resume_and_delete()
     test_snapshot_and_restore()
+    test_list_and_delete_snapshot()
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()
