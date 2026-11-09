@@ -67,6 +67,7 @@ sb.stop()                                      # without `with`, you stop it you
 | `runtime` | docker runtime, default `runsc`. With a separate GUI runtime: `"runsc-gui"`. Must be a gVisor runtime: plain `runc` is refused for `gui` (it runs `--privileged`, which is only simulated under gVisor) |
 | `limits` | `Limits(cpus, memory, pids, shm, disk)`: default 2 cores, `2g`, 512 processes, docker's `/dev/shm` size, `5g` root disk. Zero or negative values are rejected (docker and runsc would read 0 as unlimited) |
 | `network` | `"bridge"` (internet, default), `"none"` (headless only) or the name of a docker network you created |
+| `egress` | an allowlist of hosts the sandbox may reach, instead of all or nothing: see [Limiting outbound traffic](#limiting-outbound-traffic). Headless only; don't combine with `network=` |
 | `lifetime` | seconds until the sandbox deletes itself, even if your process dies (headless only) |
 | `idle_ttl` | seconds without an `exec()` before the sandbox deletes itself, even if your process dies (headless only). Expiry can lag by up to ~5s. See below |
 | `name` | makes the sandbox resumable, see below |
@@ -115,6 +116,25 @@ with create_sandbox("python:3.12", name="my-project") as sb:
 For a remote host the RDP port is on that host's `127.0.0.1`: tunnel it with `ssh -L`.
 `network="none"` cuts network access (headless only: GUI needs the published port).
 
+### Limiting outbound traffic
+
+```python
+sb = create_sandbox("python:3.12-slim", egress=["pypi.org", "*.pythonhosted.org", "10.0.0.0/24:8080"])
+sb.exec("pip install requests")      # works: the host is on the list
+sb.exec("curl https://example.com")  # 403 from the proxy: "example.com:443 is not in this sandbox's egress allowlist"
+```
+
+The sandbox gets a private docker network (`--internal`: no route out) and the only thing on it besides the sandbox is a small allowlist proxy, which also sits on the default bridge. `HTTP_PROXY`/`HTTPS_PROXY` point at it, so `pip`, `apt`, `curl` and Python's `urllib` just work; code that ignores the variables has no route anywhere. Sandboxes with `egress=` can't reach each other either: each has its own network.
+
+- Entries are `host` (exact), `*.host` (subdomains, not `host` itself), an IPv4 address or an IPv4 network, with an optional `:port`. Ports default to 80 and 443; `host:*` is any port. There is no allow-everything entry: that is `network="bridge"`.
+- **A name only gets through if it resolves to public addresses**, so a name can't be used to reach `10.x`, the docker host or the cloud metadata endpoint (`169.254.169.254`). Reaching a private address takes an entry that says so (`10.0.0.5`, `10.0.0.0/24`). The proxy connects to the address it checked, so a second lookup can't swap it.
+- It is an HTTP(S) proxy: raw sockets (SYN scans, ICMP, UDP) don't pass.
+- The proxy runs `python:3.12-slim` (a constant in `sandbox.py`) under the same runtime, so that image has to be on the docker host or pullable. It needs a password because the default bridge can reach it: the password goes to docker on stdin, not on a command line, and is in the sandbox's environment (`HTTPS_PROXY`), where it is useless to anything that can't reach the proxy. `docker logs agvisor_proxy_<name>` shows one `allow` / `deny` line per connection.
+- A sandbox that expires (`lifetime`, `idle_ttl`) can't clean up after itself: its proxy notices within ~10 s and ends, and the empty network is removed by the next `egress=` start (networks younger than a minute are left alone). `stop()`, `delete()` and `agvisor rm` remove the proxy and network at once. Docker has ~30 default network address pools, so ~30 `egress=` sandboxes at once; widen `default-address-pools` in `daemon.json` for more.
+- Starting costs about five more docker calls: on `host="ssh://..."` that is noticeable (enable `ControlMaster`). Fixed at creation, like `limits`: re-attaching to a running named sandbox ignores `egress=`.
+- Not done: injecting credentials into requests (that needs intercepting TLS), and checking that the sandbox can't resolve outside names through docker's DNS (see Security).
+- Under gVisor, and with the proxy and the network, this has only run as unit tests so far. `tests/test_gvisor_egress.py` checks it against a real host.
+
 ### Files in and out
 
 ```python
@@ -123,6 +143,25 @@ data = sb.get("/tmp/job/result.json")                          # bytes; a relati
 ```
 
 Both go through `exec()` (base64 over stdin/stdout), so they need GNU coreutils in the image (Debian/Ubuntu), raise `SandboxGone` if the sandbox is dead and `RuntimeError` if the write or read fails. `get()` reads regular files only and raises `ValueError` past `max_bytes` (default 10 MB): the sandbox is untrusted, so what comes out of it is capped. `tests/test_files.py` runs both against a real container.
+
+```python
+sb.put_dir("./project", "/workspace/project")   # a whole directory in: created, same-named files replaced, others kept
+sb.get_dir("/workspace/out", "./results")       # and out (max_bytes=50 MB of tar)
+```
+
+They are a tar through `put()`/`get()` (GNU tar in the image). `put_dir` copies links as links and never follows them, so a link on your side can't pull a host file into the sandbox, and resets owners. `get_dir` extracts what an untrusted sandbox sends with tarfile's `data` filter: nothing lands outside the destination, no device files, no links that point out, no setuid bits (`tarfile.FilterError` otherwise). From a shell: `agvisor put NAME ./file-or-dir /remote/path` and `agvisor get NAME /remote/path ./local`.
+
+### Background jobs
+
+```python
+job = sb.spawn("python scan.py targets.txt", timeout=36000)   # returns at once; it outlives this exec() and your process
+while (rc := job.poll()) is None:                              # or job.wait(timeout=...)
+    chunk = job.read(offset); offset += len(chunk)             # bytes since `offset`, stdout and stderr merged
+job.kill()                                                     # TERM to the command and what it started; kill(force=True) = KILL
+Job(sb, job_id).wait()                                         # pick a job up again after your process restarted
+```
+
+`exec(timeout=)` has to stay under `idle_ttl`, so anything longer goes here. A job writes to `/var/tmp/.agvisor-jobs/<id>/` (the root filesystem, so `Limits.disk` caps its log). Exit codes: 124 = hit its `timeout`, 143 = killed (TERM), 137 = KILL. `wait()` makes one `exec()` per ~25 s. A running job does **not** keep an `idle_ttl` sandbox alive (background processes never did), but `poll()`, `read()` and `wait()` are execs, so a client that checks on it does; set `lifetime` for a hard budget. `Limits.disk` is the only cap on how much a job logs. `tests/test_gvisor_jobs.py` runs this against real gVisor.
 
 ### Expiry and cleanup
 
@@ -139,14 +178,14 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 - `list_sandboxes()` also finds anonymous sandboxes left behind by a crashed process. Don't `start()` a stopped handle: it would make a fresh default-image container.
 - `sb.created` is a timezone-aware `datetime` (second precision) of when the container was made, so a retention job can stop what is older than it should be: `[sb.stop() for sb in list_sandboxes() if now - sb.created > max_age]`. Sandboxes from `create_sandbox()` have `created = None`.
 - `owner=` tags a sandbox, e.g. with a tenant id: `create_sandbox(name="u42-scan7", owner="u42")`, and `list_sandboxes(owner="u42")` lists only theirs. See the `name=` note under Security for what it does and doesn't protect.
-- `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code. A retention job is `agvisor rm --older-than 14400` in cron. `exec` doesn't count as activity for `idle_ttl`.
+- `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code; `put` and `get` copy files and directories (see Files in and out). A retention job is `agvisor rm --older-than 14400` in cron. `exec`, `put` and `get` don't count as activity for `idle_ttl`.
 
 ## Coding agents (skill + MCP server)
 
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
 
 - **Skill**, [`.claude/skills/agvisor/SKILL.md`](https://github.com/cr-sbarbouche/agvisor/blob/main/.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
-- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)` and `reset()` (plus `snapshot()`/`restore()`, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
+- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)`, `read_file(path)`, `list_files(path)`, `start_job(command)`/`job_output(job_id, offset)`/`kill_job(job_id)` for what outlives `run()`, and `reset()` (plus `snapshot()`/`restore()`, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
 
 Settings are environment variables, so the agent can't pick its own image, network or limits:
 
@@ -154,6 +193,7 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 |---|---|
 | `AGVISOR_HOST` | local docker / `$DOCKER_HOST`; `ssh://user@vm` for a remote Linux host |
 | `AGVISOR_NETWORK` | `none` (no internet: `pip install` fails). `bridge` for internet |
+| `AGVISOR_EGRESS` | unset. Comma-separated hosts the sandbox may reach, e.g. `pypi.org,files.pythonhosted.org`: [`egress=`](#limiting-outbound-traffic), instead of `AGVISOR_NETWORK` |
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
@@ -230,6 +270,7 @@ In `web/`: `npm test` checks the token round trip against the real gateway with 
 - **`/workspace` has no size cap.** `Limits(disk=)` only caps the root filesystem. The `/workspace` volume of a named sandbox is a plain host directory, so a runaway or hostile process can fill the host's disk through it. Anonymous sandboxes have no volume: their writes fall under `disk` (and RAM-backed `/tmp` under `memory`). For named ones, put `/var/lib/docker` on a disk of its own, so a full disk doesn't take other services down with it.
 - **Sandboxes on one docker network can reach each other.** That is Docker's default: every sandbox on `"bridge"` (the default) or on a network you share between tenants can connect to the others' open ports. Use `network="none"`, a separate network per tenant or run, or a network created with `-o com.docker.network.bridge.enable_icc=false` (from Docker's documentation; not tested with agvisor).
 - **`network="bridge"` also reaches the outside:** the internet, services listening on the host itself (through the bridge gateway), and on a cloud VM the metadata endpoint that serves instance credentials (see Host setup). Block what you don't want on the host's firewall, or use `network="none"`.
+- **`egress=` limits what a sandbox can connect to, not what it can say.** Allowed hosts can receive anything (data can ride in a URL to an allowed host), and an allowed name that an attacker controls the DNS of (a `*.` entry on a domain someone else can add subdomains to) can serve anything. I have not checked whether docker's embedded DNS on the private network still forwards lookups of arbitrary names to the host's resolver: if it does, names (not connections) can leave, a slow covert channel. The proxy and the network are plain docker objects: whoever can run `docker` can read the proxy password and the allowlist.
 - **`gui=True` runs `--privileged`.** Under gVisor that only grants simulated capabilities; under plain `runc` it would be real, so agvisor refuses `runc` for GUI sandboxes. The RDP password is random per sandbox and the gateway token is encrypted and authenticated, but anyone holding a token can open a session until it expires.
 
 To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening a public issue (details in `SECURITY.md`).
