@@ -2,6 +2,7 @@ import base64
 import contextlib
 import io
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from agvisor import Limits, Sandbox, SandboxGone
+from agvisor import Job, Limits, Sandbox, SandboxGone
 from agvisor.sandbox import _RDP_SETUP, create_sandbox, list_sandboxes
 
 
@@ -580,6 +581,147 @@ def test_egress_proxy():
     assert "allow 127.0.0.1" in log.getvalue() and "deny localhost" in log.getvalue()
 
 
+def test_jobs():
+    sb, calls, answers = Sandbox(idle_ttl=60), [], []
+
+    def fake_exec(cmd, *, timeout, on_output=None, input=None):
+        calls.append((cmd, timeout))
+        rc, out = answers.pop(0) if answers else (0, "")
+        if on_output:
+            on_output(out)
+        return subprocess.CompletedProcess([], rc, out, "boom")
+
+    sb.exec = fake_exec
+    odd = "echo \"it's\"; $(id) `x`"  # reaches a shell as one argument
+    job = sb.spawn(odd, timeout=90)
+    cmd, t = calls[0]
+    assert re.fullmatch(r"[0-9a-f]{12}", job.id) and f"/var/tmp/.agvisor-jobs/{job.id}" in cmd
+    assert f"{shlex.quote(odd)} 90 >/dev/null 2>&1 </dev/null &" in cmd and t == 30  # detached from docker exec's pipes
+    sb.spawn("x")
+    assert " x 0 >/dev/null" in calls[1][0]  # no timeout
+    assert Sandbox(idle_ttl=20)._short() == 13 and Sandbox()._short() == 30  # exec() refuses timeout >= idle_ttl - 6
+    for bad in ({"timeout": 0}, {"timeout": -1}):
+        try:
+            sb.spawn("x", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+    answers.append((1, ""))
+    try:
+        sb.spawn("x")
+    except RuntimeError as e:
+        assert "spawn failed" in str(e)
+    else:
+        raise AssertionError("a job that never started must raise")
+
+    calls.clear()
+    answers[:] = [(0, ""), (0, "3\n")]
+    assert job.poll() is None and job.poll() == 3 and job.poll() == 3 and len(calls) == 2  # an exit code is remembered
+    assert job.returncode == 3
+    other = Job(sb, "0123456789ab")
+    answers[:] = [(2, "")]
+    for call in (other.poll, other.kill, lambda: other.wait(1)):
+        answers[:] = [(2, "")]
+        try:
+            call()
+        except LookupError:
+            continue
+        raise AssertionError("an unknown job must raise LookupError")
+    for bad in ("../x", "", "0123456789AB", "x" * 12):
+        try:
+            Job(sb, bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted job id {bad!r}")
+
+    calls.clear()
+    answers[:] = [(0, ""), (0, ""), (0, "0\n")]
+    assert Job(sb, "0123456789ab").wait() == 0
+    assert [t for _, t in calls] == [30, 30, 30] and "seq 25" in calls[0][0]  # slices: one exec per ~25 s, under idle_ttl
+    try:
+        Job(Sandbox(idle_ttl=12), "0123456789ab").wait()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a wait() that can't fit under idle_ttl must say so")
+    calls.clear()
+    clock = iter([0, 0, 100])  # started at 0; still running after one 10 s slice; the deadline passed by the next look
+    with mock.patch("agvisor.sandbox.time.monotonic", lambda: next(clock)):
+        answers[:] = [(0, ""), (0, "")]
+        try:
+            Job(sb, "0123456789ab").wait(10)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("expected TimeoutError")
+    assert "seq 10" in calls[0][0] and len(calls) == 1  # the last slice is no longer than what is left
+
+    calls.clear()
+    j = Job(sb, "0123456789ab")
+    j.kill()
+    j.kill(force=True)
+    assert "kill -s TERM -- -$(cat /var/tmp/.agvisor-jobs/0123456789ab/pid)" in calls[0][0] and "kill -s KILL" in calls[1][0]
+
+    rs = Sandbox(idle_ttl=60)  # the real exec(), over a fake _stream
+    seen = []
+    rs._stream = lambda *a, on_output: (seen.append(a[-1]), on_output(base64.b64encode(b"h\xc3\xa9llo").decode()),
+                                        subprocess.CompletedProcess(a, 0, "", ""))[2]
+    j = Job(rs, "0123456789ab")
+    assert j.read(10, 50) == "h\u00e9llo".encode()
+    assert "tail -c +11 /var/tmp/.agvisor-jobs/0123456789ab/log | head -c 50 | base64 -w0" in seen[0]  # bytes, 1-based
+    rs._stream = lambda *a, on_output: (on_output("no such job\n"), subprocess.CompletedProcess(a, 2, "no such job\n", ""))[1]
+    try:
+        j.read()
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("reading an unknown job must raise LookupError")
+
+
+def test_mcp_jobs():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        idle_ttl = 600
+
+        def __init__(self):
+            self.calls, self.rc, self.out, self.gone, self.stopped = [], None, b"", False, False
+
+        def spawn(self, cmd, *, timeout):
+            self.calls.append(("spawn", cmd, timeout))
+            return Job(self, "0123456789ab")
+
+        def exec(self, cmd, *, timeout, on_output=None):  # what Job.poll() / .kill() run
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            return subprocess.CompletedProcess([], 0, "" if self.rc is None else f"{self.rc}\n", "")
+
+        def _b64(self, script, max_bytes, timeout):
+            self.calls.append(("read", script))
+            return self.out[:max_bytes]
+
+        def _short(self):
+            return 30
+
+        def stop(self):
+            self.stopped = True
+
+    box = Fake()
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+        assert m.start_job("sleep 99", timeout=60) == "0123456789ab" and box.calls == [("spawn", "sleep 99", 60)]
+        box.out = "caf\u00e9\n".encode()
+        assert m.job_output("0123456789ab") == "caf\u00e9\n\n[running; next offset 6]"  # offsets count bytes
+        box.rc = 0
+        assert m.job_output("0123456789ab", 6).endswith("[exit 0; next offset 12]")
+        assert "invalid job id" in m.job_output("../../etc")  # the agent's string never reaches a shell path
+        assert "invalid job id" in m.kill_job("x")
+        assert m.kill_job("0123456789ab") == "sent TERM to job 0123456789ab"
+        box.gone = True
+        assert m.job_output("0123456789ab").startswith("sandbox was reset") and box.stopped and m._sb is None
+    m._sb = None
+
+
 def test_cli():
     from agvisor import cli
 
@@ -754,8 +896,10 @@ if __name__ == "__main__":
     test_put_and_get()
     test_egress_args()
     test_egress_proxy()
+    test_jobs()
     test_cli()
     test_mcp_server()
     test_mcp_write_file()
+    test_mcp_jobs()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")

@@ -12,7 +12,7 @@ import os
 import threading
 
 from .limits import Limits
-from .sandbox import SandboxGone, create_sandbox
+from .sandbox import Job, SandboxGone, create_sandbox
 
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
 _CHECKPOINT = "checkpoint"  # ponytail: one snapshot slot, so an agent can't pile up full copies of /workspace
@@ -72,6 +72,43 @@ def write_file(path: str, content: str) -> str:
     return f"wrote {len(content.encode())} bytes to {path}"
 
 
+def start_job(command: str, timeout: int | None = None) -> str:
+    """Start a shell command in the background of the sandbox and return its job id at once: for what takes longer than
+    run() allows (a long scan, a build, a server). Read its output with job_output(). `timeout` (seconds) kills it;
+    default: runs until it ends or you kill_job() it. The sandbox is deleted after being idle for a while, and a
+    running job goes with it: calls to job_output() count as activity, the job itself does not."""
+    try:
+        return _get().spawn(command, timeout=timeout).id
+    except SandboxGone as e:
+        return _gone(e)
+
+
+def job_output(job_id: str, offset: int = 0) -> str:
+    """New output of a background job (stdout and stderr merged) from byte `offset` on, then its state: `[running; next
+    offset N]` or `[exit CODE; next offset N]` (124 = hit its timeout, 143 = killed). Pass the next offset back to get
+    only what is new. When the state is exit and the output was cut at ~30 KB, call again with the next offset."""
+    try:
+        job = Job(_get(), job_id)
+        rc = job.poll()  # first: once it has ended, the log is complete
+        data = job.read(offset, _MAX)
+    except SandboxGone as e:
+        return _gone(e)
+    except (LookupError, ValueError) as e:
+        return f"{e}. Jobs are lost when the sandbox is reset."
+    return f"{data.decode(errors='replace')}\n[{'running' if rc is None else f'exit {rc}'}; next offset {offset + len(data)}]"
+
+
+def kill_job(job_id: str) -> str:
+    """Stop a background job and what it started. Look at job_output() for how it ended."""
+    try:
+        Job(_get(), job_id).kill()
+    except SandboxGone as e:
+        return _gone(e)
+    except (LookupError, ValueError) as e:
+        return f"{e}. Jobs are lost when the sandbox is reset."
+    return f"sent TERM to job {job_id}"
+
+
 def reset() -> str:
     """Destroy the sandbox and everything in it. The next run() starts a fresh one. With snapshot/restore tools,
     /workspace survives: use restore() to roll that back."""
@@ -105,6 +142,9 @@ def main():
     app = MCPServer("agvisor")
     app.tool()(run)
     app.tool()(write_file)
+    app.tool()(start_job)
+    app.tool()(job_output)
+    app.tool()(kill_job)
     app.tool()(reset)
     if _env("NAME"):  # snapshots need a named sandbox
         app.tool()(snapshot)

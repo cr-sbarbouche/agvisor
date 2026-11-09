@@ -1,11 +1,13 @@
 import base64
 import codecs
 import collections
+import math
 import os
 import re
 import secrets
 import shlex
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,11 @@ systemctl --user restart $S
 wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 """
 _PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
+# spawn(): a job lives in _JOBS/<id>/{log,pid,rc}. The rootfs, so `disk` caps what a job logs (/tmp is RAM under gVisor).
+# _JOB runs as `sh -c _JOB DIR COMMAND TIMEOUT` (0 = none): GNU timeout starts a process group of its own whose id is its
+# pid, so `kill -- -PID` reaches the command and whatever it started; it also writes the exit code when it ends.
+_JOBS = "/var/tmp/.agvisor-jobs"
+_JOB = 'timeout -k 5 "$2" sh -c "$1" >"$0/log" 2>&1 </dev/null & echo $! >"$0/pid"; wait $!; echo $? >"$0/rc"'
 _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
 
 
@@ -40,6 +47,73 @@ class SandboxGone(RuntimeError):
     """exec() found the container dead or deleted: killed for going over memory/pids, expired (lifetime/idle_ttl), or
     removed. It is not a failed command. Named sandboxes: create_sandbox(name=...) again gives a fresh container on
     the same volume."""
+
+
+class Job:
+    """A command running in the background of a sandbox, from Sandbox.spawn(). It outlives your process, and ends when
+    it finishes, is kill()ed, or the sandbox goes (idle_ttl and lifetime too: poll(), read() and wait() count as
+    activity for idle_ttl, the job itself does not). `Job(sandbox, id)` picks one up again later."""
+
+    def __init__(self, sandbox, id):
+        if not re.fullmatch(r"[0-9a-f]{12}", id):
+            raise ValueError(f"invalid job id {id!r}")
+        self.sandbox, self.id, self.returncode = sandbox, id, None
+        self._d = f"{_JOBS}/{id}"
+
+    def _check(self, wait=0):
+        """One exec: wait up to `wait` seconds for the job to end. Its exit code, or None while it runs."""
+        d = self._d
+        r = self.sandbox.exec(f"[ -d {d} ] || exit 2; for i in $(seq {wait}); do [ -e {d}/rc ] && break; sleep 1; done; "
+                              f"cat {d}/rc 2>/dev/null; true", timeout=wait + 5)
+        if r.returncode == 2:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}")
+        if r.returncode:
+            raise RuntimeError(f"checking job {self.id} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+        if r.stdout.strip():
+            self.returncode = int(r.stdout)
+        return self.returncode
+
+    def poll(self):
+        """The exit code, or None while it still runs. 143 = killed with TERM, 137 = KILL, 124 = hit its timeout."""
+        return self.returncode if self.returncode is not None else self._check()
+
+    def wait(self, timeout=None):
+        """Block until it ends and return the exit code; TimeoutError after `timeout` seconds (it keeps running).
+        One exec() per ~25 s: cheap over ssh."""
+        end = None if timeout is None else time.monotonic() + timeout
+        ttl = self.sandbox.idle_ttl
+        cap = min(25, ttl - 12) if ttl else 25  # exec(timeout=wait+5) must stay under idle_ttl - 6
+        if cap < 1:
+            raise ValueError(f"idle_ttl={ttl}s is too short to wait() in")
+        while self.returncode is None:
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                raise TimeoutError(f"job {self.id} is still running")
+            self._check(cap if left is None else max(1, min(cap, math.ceil(left))))
+        return self.returncode
+
+    def read(self, offset=0, max_bytes=100_000):
+        """Its output (stdout and stderr merged) from byte `offset` on, at most `max_bytes`, as bytes. The next read
+        starts at offset + len(result); empty = nothing new yet. A job's log lives in the sandbox's disk, uncapped
+        apart from `Limits.disk`."""
+        d = self._d
+        try:
+            data = self.sandbox._b64(f"[ -f {d}/log ] || {{ echo 'no such job' >&2; exit 2; }}; "
+                                     f"tail -c +{int(offset) + 1} {d}/log | head -c {int(max_bytes)} | base64 -w0",
+                                     int(max_bytes), self.sandbox._short())
+        except RuntimeError as e:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}: {e}") from None
+        if data is None:
+            raise RuntimeError("the sandbox sent more output than asked for")
+        return data
+
+    def kill(self, force=False):
+        """Stop it and what it started (TERM; `force` = KILL). Not an error if it already ended: wait() gives the code."""
+        d = self._d
+        r = self.sandbox.exec(f"[ -d {d} ] || exit 2; kill -s {'KILL' if force else 'TERM'} -- -$(cat {d}/pid) 2>/dev/null; true",
+                              timeout=self.sandbox._short())
+        if r.returncode == 2:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}")
 
 
 class Sandbox:
@@ -261,6 +335,24 @@ class Sandbox:
             raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
         return r
 
+    def _short(self):  # an exec() that only looks at files: well under idle_ttl, whatever it is
+        return min(30, self.idle_ttl - 7) if self.idle_ttl else 30
+
+    def spawn(self, cmd, *, timeout=None):
+        """Start `sh -c cmd` in the background and return a Job at once, for what outlives a single exec(): a long scan, a
+        dev server. `timeout` kills it after that many seconds; the default is to run until it ends, is kill()ed or the
+        sandbox goes. exec(timeout=) must stay under idle_ttl, a background job doesn't have to, but nothing keeps the
+        sandbox alive for it either: poll() it, or set `lifetime` for a hard budget. Same image requirements as exec()."""
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0 seconds")
+        job = Job(self, uuid.uuid4().hex[:12])
+        d = shlex.quote(job._d)
+        r = self.exec(f"mkdir -p {d} && {{ sh -c {shlex.quote(_JOB)} {d} {shlex.quote(cmd)} {int(timeout or 0)} >/dev/null 2>&1 </dev/null & }}; "
+                      f"for i in $(seq 50); do [ -s {d}/pid ] && exit 0; sleep 0.1; done; exit 1", timeout=self._short())
+        if r.returncode:
+            raise RuntimeError(f"spawn failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+        return job
+
     def put(self, path, data: bytes, *, timeout=120):
         """Write `data` to `path` inside: parent directories are created, an existing file is replaced. Goes through
         exec() (base64 on stdin: any bytes survive, a dead sandbox raises SandboxGone). Relative paths start in
@@ -270,9 +362,10 @@ class Sandbox:
         if r.returncode:
             raise RuntimeError(f"put {path!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
 
-    def get(self, path, *, max_bytes=10_000_000, timeout=120):
-        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
-        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+    def _b64(self, script, max_bytes, timeout):
+        """Run `script`, which prints base64, and decode it; None if it is more than max_bytes. It is the sandbox talking:
+        a doctored `base64` can't fill our memory. A failing script raises RuntimeError with what it printed (stderr is
+        merged into the same stream)."""
         out, size = [], 0
         limit = 4 * (max_bytes // 3 + 2)  # base64 characters of max_bytes+1 bytes; a sandbox that sends more is lying
 
@@ -282,13 +375,22 @@ class Sandbox:
             if size <= limit:
                 out.append(text)
 
-        q = shlex.quote(path)
-        r = self.exec(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
-                      timeout=timeout, on_output=keep)  # on_output: bounded memory, stderr merged into the same stream
+        r = self.exec(script, timeout=timeout, on_output=keep)  # on_output: bounded memory
         if r.returncode:
-            raise RuntimeError(f"get {path!r} failed (exit {r.returncode}): {r.stdout.strip()[-300:]}")
+            raise RuntimeError(f"exit {r.returncode}: {r.stdout.strip()[-300:]}")
         data = None if size > limit else base64.b64decode("".join(out), validate=True)
-        if data is None or len(data) > max_bytes:
+        return data if data is not None and len(data) <= max_bytes else None
+
+    def get(self, path, *, max_bytes=10_000_000, timeout=120):
+        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
+        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+        q = shlex.quote(path)
+        try:
+            data = self._b64(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
+                             max_bytes, timeout)
+        except RuntimeError as e:
+            raise RuntimeError(f"get {path!r} failed ({e})") from None
+        if data is None:
             raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
         return data
 
