@@ -9,12 +9,14 @@ AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a dock
 tools exist."""
 import atexit
 import os
+import shlex
 import threading
 
 from .limits import Limits
 from .sandbox import Job, SandboxGone, create_sandbox
 
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
+_READ = 100_000  # read_file(): bytes of one file
 _CHECKPOINT = "checkpoint"  # ponytail: one snapshot slot, so an agent can't pile up full copies of /workspace
 _sb = None  # One sandbox per server process. Anonymous unless AGVISOR_NAME is set: then /workspace is a volume with
 _lock = threading.Lock()  # no size cap, shared by every server process using that name.
@@ -22,6 +24,10 @@ _lock = threading.Lock()  # no size cap, shared by every server process using th
 
 def _env(key, default=None):
     return os.environ.get(f"AGVISOR_{key}") or default
+
+
+def _t(sb, seconds):  # exec() refuses a timeout that could outlive the idle watchdog: keep it 7 s under
+    return max(1, min(seconds, sb.idle_ttl - 7))
 
 
 def _get():
@@ -48,8 +54,7 @@ def run(command: str, timeout: int = 120) -> str:
     (off by default, or only a few hosts), so `pip install` may fail by design."""
     try:
         sb = _get()
-        # exec() refuses a timeout that could outlive the idle watchdog: keep it 7 s under
-        r = sb.exec(command, timeout=max(1, min(timeout, sb.idle_ttl - 7)), on_output=lambda _: None)  # streaming bounds memory
+        r = sb.exec(command, timeout=_t(sb, timeout), on_output=lambda _: None)  # streaming bounds memory
     except SandboxGone as e:
         return _gone(e)
     return f"{r.stdout[-_MAX:]}\n[exit {r.returncode}]"
@@ -66,10 +71,37 @@ def write_file(path: str, content: str) -> str:
     Use it instead of a heredoc, which breaks on quoting and on very long content. Use an absolute path
     (/tmp/a.py, or /workspace/a.py when the sandbox keeps /workspace)."""
     try:
-        _get().put(path, content.encode())
+        sb = _get()
+        sb.put(path, content.encode(), timeout=_t(sb, 120))
     except SandboxGone as e:
         return _gone(e)
     return f"wrote {len(content.encode())} bytes to {path}"
+
+
+def read_file(path: str) -> str:
+    """Read a text file inside the sandbox (up to 100 KB; for more, use run() with head, tail or grep). Use an
+    absolute path, or one relative to /workspace when the sandbox keeps /workspace."""
+    try:
+        sb = _get()
+        data = sb.get(path, max_bytes=_READ, timeout=_t(sb, 120))
+    except SandboxGone as e:
+        return _gone(e)
+    except RuntimeError as e:
+        return f"cannot read {path}: {e}"
+    except ValueError:
+        return f"{path} is bigger than {_READ} bytes: use run() with head, tail or grep"
+    return f"{path} is binary ({len(data)} bytes)" if b"\0" in data else data.decode(errors="replace")
+
+
+def list_files(path: str = ".") -> str:
+    """List a directory inside the sandbox: permissions, size, date, name (a trailing / marks a directory). Hidden files
+    included. A relative path starts in /workspace when the sandbox keeps /workspace, else in /."""
+    try:
+        sb = _get()
+        r = sb.exec(f"ls -lAp --time-style=long-iso -- {shlex.quote(path)}", timeout=_t(sb, 30), on_output=lambda _: None)
+    except SandboxGone as e:
+        return _gone(e)
+    return f"{r.stdout[-_MAX:]}\n[exit {r.returncode}]"
 
 
 def start_job(command: str, timeout: int | None = None) -> str:
@@ -142,6 +174,8 @@ def main():
     app = MCPServer("agvisor")
     app.tool()(run)
     app.tool()(write_file)
+    app.tool()(read_file)
+    app.tool()(list_files)
     app.tool()(start_job)
     app.tool()(job_output)
     app.tool()(kill_job)

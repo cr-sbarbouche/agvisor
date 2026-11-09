@@ -722,6 +722,89 @@ def test_mcp_jobs():
     m._sb = None
 
 
+def test_put_dir_and_get_dir():
+    import tarfile
+    import tempfile
+
+    sb, execs, puts = Sandbox(), [], []
+    sb.exec = lambda cmd, **kw: (execs.append(cmd), subprocess.CompletedProcess([], 0, "", ""))[1]
+    sb.put = lambda path, data, **kw: puts.append((path, data))
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d, "proj")
+        (root / "sub").mkdir(parents=True)
+        (root / "a.txt").write_text("a")
+        (root / "sub" / "b.bin").write_bytes(b"\x00\xff")
+        (root / "link").symlink_to("/etc/passwd")  # copied as a link, not followed: the host's file does not travel
+        sb.put_dir(str(root), "/work dir")
+        (tmp, data), = puts
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            ms = {m.name: m for m in t.getmembers()}
+            assert {"./a.txt", "./sub/b.bin", "./link"} <= set(ms) and ms["./link"].issym() and ms["./link"].linkname == "/etc/passwd"
+            assert all(m.uid == m.gid == 0 and not m.uname and not m.gname for m in ms.values())  # no local user names
+            assert t.extractfile(ms["./sub/b.bin"]).read() == b"\x00\xff"
+        assert tmp.startswith("/var/tmp/.agvisor-") and tmp.endswith(".tar")
+        assert execs == [f"mkdir -p -- '/work dir' && tar -xf {tmp} -C '/work dir' --no-same-owner; rc=$?; rm -f {tmp}; exit $rc"]
+        try:
+            sb.put_dir(str(root / "a.txt"), "/x")
+        except NotADirectoryError:
+            pass
+        else:
+            raise AssertionError("a file is not a directory")
+
+        def tar_of(*members):  # members: (name, kind, payload)
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as t:
+                for name, kind, payload in members:
+                    ti = tarfile.TarInfo(name)
+                    ti.type = {"file": tarfile.REGTYPE, "link": tarfile.SYMTYPE, "dir": tarfile.DIRTYPE}[kind]
+                    if kind == "link":
+                        ti.linkname = payload
+                    ti.size = len(payload) if kind == "file" else 0
+                    t.addfile(ti, io.BytesIO(payload) if kind == "file" else None)
+            return buf.getvalue()
+
+        sb.get = lambda path, *, max_bytes, timeout: got
+        dest = Path(d, "out")
+        got = tar_of((".", "dir", None), ("./ok.txt", "file", b"hi"), ("./sub", "dir", None), ("./sub/c", "file", b"c"))
+        sb.get_dir("/work dir", str(dest))
+        assert (dest / "ok.txt").read_bytes() == b"hi" and (dest / "sub" / "c").read_bytes() == b"c"
+        assert execs[-2].startswith("[ -d '/work dir' ] ||") and execs[-2].endswith(" -C '/work dir' .") and execs[-1].startswith("rm -f ")
+        evil = {"parent": [("../escaped", "file", b"x")],
+                "link out": [("./l", "link", "../../etc"), ("./l/pwn", "file", b"x")], "link abs": [("./l", "link", "/etc")]}
+        for what, members in evil.items():
+            got = tar_of(*members)
+            try:
+                sb.get_dir("/x", str(Path(d, "safe")))
+            except tarfile.FilterError:
+                pass
+            else:
+                raise AssertionError(f"extracted a {what} member")
+        assert not Path(d, "escaped").exists()
+        got = tar_of(("/tmp/agvisor-escaped", "file", b"x"))  # an absolute name is made relative: it lands inside
+        sb.get_dir("/x", str(Path(d, "safe")))
+        assert Path(d, "safe", "tmp", "agvisor-escaped").read_bytes() == b"x" and not Path("/tmp/agvisor-escaped").exists()
+        sb.get = lambda path, *, max_bytes, timeout: (_ for _ in ()).throw(ValueError("larger than max_bytes"))
+        try:
+            sb.get_dir("/x", str(Path(d, "big")))
+        except ValueError:
+            assert execs[-1].startswith("rm -f ") and not Path(d, "big").exists()  # the tarball is removed, nothing is created
+        else:
+            raise AssertionError("a tar over max_bytes must raise")
+        sb.exec = lambda cmd, **kw: subprocess.CompletedProcess([], 1, "", "not a directory")
+        try:
+            sb.get_dir("/nope", str(Path(d, "x")))
+        except RuntimeError as e:
+            assert "not a directory" in str(e)
+        else:
+            raise AssertionError("a missing directory must raise")
+
+
+def _running(sb):  # a handle as list_sandboxes() makes them
+    sb._running = True
+    sb.created = datetime.now(timezone.utc)
+    return sb
+
+
 def test_cli():
     from agvisor import cli
 
@@ -765,6 +848,43 @@ def test_cli():
         with mock.patch("agvisor.sandbox.subprocess.run", fake):
             assert main("exec", "agvisor-old", "echo", "hi") == (3, "hi\n")  # the command's exit code, output as it comes
             assert main("exec", "agvisor-new", "echo")[0] == 2  # stopped: nothing to run in
+
+    import tempfile
+    seen = []
+
+    class Fake(Sandbox):  # the file operations, recorded
+        def put(self, path, data, **kw):
+            seen.append(("put", path, data))
+
+        def put_dir(self, local, remote, **kw):
+            seen.append(("put_dir", Path(local).name, remote))
+
+        def get(self, path, **kw):
+            seen.append(("get", path, kw))
+            if path == "/missing":
+                raise RuntimeError("get '/missing' failed (exit 1): not a file: /missing")
+            return b"out"
+
+        def get_dir(self, remote, local, **kw):
+            seen.append(("get_dir", remote, kw))
+
+        def exec(self, cmd, **kw):
+            return subprocess.CompletedProcess([], 0 if "dir" in cmd else 1, "", "")
+
+    calls, fake = fake_docker(ps_out=ps)
+    with tempfile.TemporaryDirectory() as d, mock.patch("agvisor.sandbox.subprocess.run", fake), \
+            mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Fake(name="old", host=None))]):
+        f = Path(d, "in.txt")
+        f.write_bytes(b"in")
+        assert main("put", "agvisor-old", str(f), "/w/in.txt") == (0, "done\n") and seen[-1] == ("put", "/w/in.txt", b"in")
+        assert main("put", "agvisor-old", d, "/w")[0] == 0 and seen[-1] == ("put_dir", Path(d).name, "/w")
+        assert main("put", "agvisor-old", str(Path(d, "nope")), "/w")[0] == 2  # a local file that is not there: an error, no traceback
+        out = Path(d, "out.txt")
+        assert main("get", "agvisor-old", "/w/x", str(out))[0] == 0 and out.read_bytes() == b"out" and seen[-1] == ("get", "/w/x", {})
+        main("get", "agvisor-old", "/w/x", str(out), "--max-bytes", "5")
+        assert seen[-1] == ("get", "/w/x", {"max_bytes": 5})
+        assert main("get", "agvisor-old", "/w/dir", str(Path(d, "o")))[0] == 0 and seen[-1] == ("get_dir", "/w/dir", {})
+        assert main("get", "agvisor-old", "/missing", str(out))[0] == 2  # the sandbox's error becomes a usage error
 
 
 def test_mcp_server():
@@ -839,13 +959,30 @@ def test_mcp_write_file():
     from agvisor import mcp_server as m
 
     class Fake:
-        def __init__(self, gone):
-            self.gone, self.puts, self.stopped = gone, [], False
+        idle_ttl = 60  # exec() refuses timeout >= idle_ttl - 6
 
-        def put(self, path, data):
+        def __init__(self, gone):
+            self.gone, self.puts, self.stopped, self.files, self.execs = gone, [], False, {}, []
+
+        def put(self, path, data, *, timeout):
             if self.gone:
                 raise SandboxGone("agvisor-x is gone")
+            assert timeout == 53  # clamped under idle_ttl
             self.puts.append((path, data))
+
+        def get(self, path, *, max_bytes, timeout):
+            assert timeout == 53
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            if path not in self.files:
+                raise RuntimeError(f"get {path!r} failed (exit 1): not a file: {path}")
+            if len(self.files[path]) > max_bytes:
+                raise ValueError("too big")
+            return self.files[path]
+
+        def exec(self, cmd, *, timeout, on_output):
+            self.execs.append((cmd, timeout))
+            return subprocess.CompletedProcess([], 0, "-rw-r--r-- 1 root root 3 2026-11-09 12:00 a b.txt\n", "")
 
         def stop(self):
             self.stopped = True
@@ -855,6 +992,12 @@ def test_mcp_write_file():
     with mock.patch.object(m, "create_sandbox", lambda *a, **kw: boxes.append(Fake(len(boxes) == 1)) or boxes[-1]):
         assert m.write_file("/tmp/a.py", "caf\u00e9") == "wrote 5 bytes to /tmp/a.py"  # bytes, not characters
         assert boxes[0].puts == [("/tmp/a.py", "caf\u00e9".encode())]
+        boxes[0].files = {"/a": "caf\u00e9".encode(), "/bin": b"\x7fELF\x00\x01", "/big": b"x" * 100_001}
+        assert m.read_file("/a") == "caf\u00e9"
+        assert m.read_file("/bin") == "/bin is binary (6 bytes)"  # no NUL-laden text in the agent's context
+        assert "bigger than 100000 bytes" in m.read_file("/big") and "not a file" in m.read_file("/nope")
+        assert m.list_files("/work dir; rm x").endswith("a b.txt\n\n[exit 0]")
+        assert boxes[0].execs == [("ls -lAp --time-style=long-iso -- '/work dir; rm x'", 30)]  # the path arrives quoted
         m.reset()
         assert m.write_file("/tmp/b", "x").startswith("sandbox was reset") and boxes[1].stopped and m._sb is None
     m._sb = None
@@ -897,6 +1040,7 @@ if __name__ == "__main__":
     test_egress_args()
     test_egress_proxy()
     test_jobs()
+    test_put_dir_and_get_dir()
     test_cli()
     test_mcp_server()
     test_mcp_write_file()

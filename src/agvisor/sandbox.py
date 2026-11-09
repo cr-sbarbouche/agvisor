@@ -1,12 +1,14 @@
 import base64
 import codecs
 import collections
+import io
 import math
 import os
 import re
 import secrets
 import shlex
 import subprocess
+import tarfile
 import time
 import uuid
 from datetime import datetime
@@ -361,6 +363,44 @@ class Sandbox:
         r = self.exec(f'mkdir -p -- "$(dirname -- {q})" && base64 -d > {q}', input=base64.b64encode(data).decode(), timeout=timeout)
         if r.returncode:
             raise RuntimeError(f"put {path!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def put_dir(self, local, remote, *, timeout=120):
+        """Copy the local directory `local` into `remote` inside: created if needed, files of the same name replaced,
+        others kept. A tar through put(), so the same limits (GNU tar and coreutils in the image). Links are copied as
+        links, never followed: a link on your side can't pull a host file into the sandbox. Owners are reset."""
+        if not os.path.isdir(local):
+            raise NotADirectoryError(local)
+
+        def clean(ti):  # your uid and user name are none of the sandbox's business
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = ""
+            return ti
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as t:
+            t.add(local, arcname=".", filter=clean)
+        tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
+        self.put(tmp, buf.getvalue(), timeout=timeout)
+        r = self.exec(f"mkdir -p -- {q} && tar -xf {tmp} -C {q} --no-same-owner; rc=$?; rm -f {tmp}; exit $rc", timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"put_dir {remote!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def get_dir(self, remote, local, *, max_bytes=50_000_000, timeout=120):
+        """Copy the directory `remote` inside to `local` here: created if needed, files of the same name replaced. The
+        sandbox is untrusted, so the tar that comes out is capped at `max_bytes` (ValueError) and extracted with
+        tarfile's "data" filter: nothing lands outside `local`, no device files, no links that point out of it,
+        no setuid bits (tarfile.FilterError otherwise)."""
+        tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
+        r = self.exec(f"[ -d {q} ] || {{ echo 'not a directory' >&2; exit 1; }}; tar -cf {tmp} -C {q} .", timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"get_dir {remote!r} failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+        try:
+            data = self.get(tmp, max_bytes=max_bytes, timeout=timeout)
+        finally:
+            self.exec(f"rm -f {tmp}", timeout=timeout)
+        os.makedirs(local, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            t.extractall(local, filter="data")
 
     def _b64(self, script, max_bytes, timeout):
         """Run `script`, which prints base64, and decode it; None if it is more than max_bytes. It is the sandbox talking:
