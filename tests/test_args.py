@@ -296,9 +296,9 @@ def test_list_sandboxes():
     assert "--label=agvisor.name=proj" in Sandbox(name="proj").run_args()
     assert not any(x.startswith("--label=agvisor.name") for x in Sandbox().run_args())
 
-    # name, state, name label, owner label, CreatedAt: tab-separated, labels may be empty
-    calls, run = fake_docker(ps_out="agvisor-proj\trunning\tproj\tu42\t2026-11-06 09:28:33 +0000 UTC\n"
-                                    "agvisor-ab12cd34\texited\t\t\t2026-11-05 23:01:02 +0100 CET\n")
+    # name, state, name label, owner label, CreatedAt, egress label: tab-separated, labels may be empty
+    calls, run = fake_docker(ps_out="agvisor-proj\trunning\tproj\tu42\t2026-11-06 09:28:33 +0000 UTC\t\n"
+                                    "agvisor-ab12cd34\texited\t\t\t2026-11-05 23:01:02 +0100 CET\t1\n")
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         named, anon = list_sandboxes()
         anon.stop()  # a leaked anonymous sandbox can be found and killed
@@ -308,7 +308,10 @@ def test_list_sandboxes():
     assert (named.owner, anon.owner) == ("u42", None)
     assert named.created == datetime(2026, 11, 6, 9, 28, 33, tzinfo=timezone.utc)
     assert anon.created == datetime(2026, 11, 5, 23, 1, 2, tzinfo=timezone(timedelta(hours=1)))  # zone name dropped
-    assert calls[-1][1:] == ["rm", "-f", "agvisor-ab12cd34"]
+    # it was made with egress=: stopping the handle must remove its proxy and network too
+    assert [c[1:] for c in calls[-3:]] == [["rm", "-f", "agvisor-ab12cd34"], ["rm", "-f", "agvisor_proxy_ab12cd34"],
+                                           ["network", "rm", "agvisor_net_ab12cd34"]]
+    assert not named._has_egress
 
 
 def test_owner():
@@ -457,6 +460,126 @@ def test_put_and_get():
         raise AssertionError("a missing file must raise")
 
 
+def test_egress_args():
+    for bad in ({"egress": []}, {"egress": ["*"]}, {"egress": ["a b"]}, {"egress": ["a,b"]}, {"egress": ["1.2.3.4/33"]},
+                {"egress": ["x.org:0"]}, {"egress": ["x.org:99999"]}, {"egress": ["x.org:"]}, {"egress": ["::1"]},
+                {"egress": ["x.org"], "network": "none"}, {"egress": ["x.org"], "gui": True}):
+        try:
+            Sandbox(**bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+    a = Sandbox(name="proj", egress=["pypi.org"]).run_args()
+    assert "--network=agvisor_net_proj" in a and "--env-file=/dev/stdin" in a and "--label=agvisor.egress=1" in a
+    assert "--network=bridge" in Sandbox().run_args() and "--env-file=/dev/stdin" not in Sandbox().run_args()
+
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append((cmd[1:], kw.get("input")))
+        return subprocess.CompletedProcess(cmd, 1 if "ubuntu:24.04" in cmd and fail else 0, "", "boom")
+
+    fail = False
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        sb = create_sandbox(name="proj", egress=["pypi.org", "*.pythonhosted.org", "10.0.0.0/24:8080"])
+        verbs = [c[0][:2] if c[0][0] in ("network", "volume") else c[0][:1] for c in calls]
+        # stale leftovers of the same name, orphans, then proxy -> network -> attach -> sandbox
+        assert verbs[3:] == [["rm"], ["rm"], ["network", "rm"], ["network", "prune"], ["run"], ["network", "create"],
+                             ["network", "connect"], ["run"]], verbs
+        proxy, create, connect, box = [c for c in calls if c[0][0] in ("run", "network") and c[0][1] not in ("rm", "prune")]
+        assert create[0] == ["network", "create", "--internal", "--label=agvisor.egress=1", "agvisor_net_proj"]
+        assert connect[0] == ["network", "connect", "--alias=proxy", "agvisor_net_proj", "agvisor_proxy_proj"]
+        penv = dict(l.split("=", 1) for l in proxy[1].split())
+        assert penv["AGVISOR_ALLOW"] == "pypi.org,*.pythonhosted.org,10.0.0.0/24:8080" and penv["AGVISOR_WATCH"] == "agvisor-proj"
+        benv = dict(l.split("=", 1) for l in box[1].split())
+        assert benv["HTTPS_PROXY"] == benv["http_proxy"] == f"http://agvisor:{penv['AGVISOR_TOKEN']}@proxy:3128"
+        assert "localhost" in benv["NO_PROXY"]
+        assert not any(penv["AGVISOR_TOKEN"] in str(c[0]) for c in calls)  # stdin only: a command line shows up in `ps`
+        assert "--runtime=runsc" in proxy[0] and "--network=agvisor_net_proj" in box[0] and "python:3.12-slim" in proxy[0]
+        assert "def parse_rules" in proxy[0][-1]  # the proxy runs the real source
+        calls.clear()
+        sb.stop()  # the sandbox first, then what it hangs on
+        assert [c[0] for c in calls] == [["rm", "-f", "agvisor-proj"], ["rm", "-f", "agvisor_proxy_proj"],
+                                         ["network", "rm", "agvisor_net_proj"]]
+
+        calls.clear()  # an anonymous sandbox has no leftovers of its name to remove first
+        create_sandbox(egress=["pypi.org"]).stop()
+        assert [c[0][:2] for c in calls] == [["network", "prune"], ["run", "-d"], ["network", "create"], ["network", "connect"],
+                                             ["run", "-d"], ["rm", "-f"], ["rm", "-f"], ["network", "rm"]]
+        fail = True  # the sandbox itself fails to start: the proxy and network must not be left behind
+        calls.clear()
+        try:
+            create_sandbox(egress=["pypi.org"])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected the failed run to propagate")
+        assert [c[0][0] for c in calls[-2:]] == ["rm", "network"] and calls[-1][0][1] == "rm"
+
+
+def test_egress_proxy():
+    import asyncio
+    import base64
+
+    from agvisor import egress_proxy as p
+
+    for e, kind, val in (("pypi.org", "name", "pypi.org"), ("*.x.org:8080", "name", "*.x.org"), ("10.0.0.5", "net", None),
+                         ("10.0.0.0/24:*", "net", None), ("PyPI.org", "name", "pypi.org")):
+        (k, v, _), = p.parse_rules([e])
+        assert k == kind and (val is None or v == val), e
+    rules = p.parse_rules(["pypi.org", "*.x.org:8080", "10.0.0.0/24", "1.2.3.4:*"])
+    ok = lambda h, port=443: p.match(rules, h, port)
+    assert ok("pypi.org") == "name" and ok("pypi.org", 80) == "name" and not ok("pypi.org", 22)  # 80 and 443 by default
+    assert not ok("www.pypi.org") and not ok("evil-pypi.org") and not ok("pypi.org.evil.com")
+    assert ok("a.x.org", 8080) == "name" and not ok("x.org", 8080) and not ok("a.x.org")  # *. = subdomains, own ports
+    assert ok("10.0.0.7") == "net" and not ok("10.0.1.7") and ok("1.2.3.4", 22) == "net"
+    assert not ok("::ffff:10.0.0.7") and not ok("::1")  # no IPv6 rules, and a v4-mapped one is not a way in
+    for addr, public in (("8.8.8.8", True), ("10.0.0.1", False), ("127.0.0.1", False), ("169.254.169.254", False),
+                         ("192.168.1.1", False), ("100.64.0.1", False), ("::ffff:10.0.0.1", False), ("::1", False)):
+        assert p._public(addr) is public, addr
+
+    async def origin(r, w):
+        await r.readuntil(b"\r\n\r\n")
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+        await w.drain()
+        w.close()
+
+    async def ask(port, data):
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(data)
+        await w.drain()
+        out = await asyncio.wait_for(r.read(), 5)
+        w.close()
+        return out
+
+    async def main():
+        o = await asyncio.start_server(origin, "127.0.0.1", 0)
+        op = o.sockets[0].getsockname()[1]
+        srv = await p.serve(p.parse_rules([f"127.0.0.1:{op}", f"localhost:{op}"]), "tok", "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        auth = b"Proxy-Authorization: Basic " + base64.b64encode(b"agvisor:tok") + b"\r\n"
+        get = lambda host, *extra: b"".join([f"GET http://{host}/x HTTP/1.1\r\nHost: h\r\n".encode(), *extra, b"\r\n"])
+        assert (await ask(port, get(f"127.0.0.1:{op}", auth))).endswith(b"\r\n\r\nhi")  # plain http, allowed
+        assert (await ask(port, get(f"127.0.0.1:{op}"))).startswith(b"HTTP/1.1 407")  # no password
+        bad = b"Proxy-Authorization: Basic " + base64.b64encode(b"agvisor:nope") + b"\r\n"
+        assert (await ask(port, get(f"127.0.0.1:{op}", bad))).startswith(b"HTTP/1.1 407")
+        out = await ask(port, get("127.0.0.1:1", auth))  # not in the allowlist: says so, and says which
+        assert out.startswith(b"HTTP/1.1 403") and b"127.0.0.1:1 is not in" in out
+        out = await ask(port, get(f"localhost:{op}", auth))  # allowed by name, but a name may not reach a private address
+        assert out.startswith(b"HTTP/1.1 403") and b"no public address" in out
+        out = await ask(port, f"CONNECT 127.0.0.1:{op} HTTP/1.1\r\n".encode() + auth + b"\r\nGET / HTTP/1.1\r\n\r\n")
+        assert out.startswith(b"HTTP/1.1 200 Connection established\r\n\r\n") and out.endswith(b"hi")  # a tunnel
+        assert (await ask(port, b"CONNECT 127.0.0.1:1 HTTP/1.1\r\n" + auth + b"\r\n")).startswith(b"HTTP/1.1 403")
+        assert (await ask(port, b"GET / HTTP/1.1\r\n" + auth + b"\r\n")).startswith(b"HTTP/1.1 400")  # not a proxy request
+        assert (await ask(port, b"GET https://x.org/ HTTP/1.1\r\n" + auth + b"\r\n")).startswith(b"HTTP/1.1 400")
+        assert (await ask(port, b"junk\r\n" + auth + b"\r\n")).startswith(b"HTTP/1.1 400")
+
+    log = io.StringIO()  # the proxy logs one line per connection
+    with contextlib.redirect_stdout(log):
+        asyncio.run(main())
+    assert "allow 127.0.0.1" in log.getvalue() and "deny localhost" in log.getvalue()
+
+
 def test_cli():
     from agvisor import cli
 
@@ -470,8 +593,8 @@ def test_cli():
         return rc, out.getvalue()
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
-    ps = ("agvisor-old\trunning\told\tu42\t2026-11-06 09:28:33 +0000 UTC\n"
-          f"agvisor-new\texited\tnew\t\t{now}\n")
+    ps = ("agvisor-old\trunning\told\tu42\t2026-11-06 09:28:33 +0000 UTC\t\n"
+          f"agvisor-new\texited\tnew\t\t{now}\t\n")
 
     def run(*argv, **kw):
         calls, fake = fake_docker(ps_out=ps, **kw)
@@ -551,6 +674,14 @@ def test_mcp_server():
         assert kws[0]["name"] is None  # anonymous unless AGVISOR_NAME says otherwise
     m._sb = None
 
+    # AGVISOR_EGRESS replaces the network setting: an allowlist, not "none"/"bridge"
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), \
+            mock.patch.dict(os.environ, {"AGVISOR_EGRESS": " pypi.org, *.pythonhosted.org ,", "AGVISOR_NETWORK": "bridge"}):
+        m.run("x")
+        assert kws[0]["egress"] == ["pypi.org", "*.pythonhosted.org"] and "network" not in kws[0]
+    m._sb = None
+
     # AGVISOR_NAME: a named sandbox, whose /workspace the checkpoint tools save and roll back
     boxes.clear(), kws.clear()
     with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
@@ -621,6 +752,8 @@ if __name__ == "__main__":
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     test_put_and_get()
+    test_egress_args()
+    test_egress_proxy()
     test_cli()
     test_mcp_server()
     test_mcp_write_file()

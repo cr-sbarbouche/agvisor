@@ -3,6 +3,8 @@
 Configured by environment variables only, so the agent can't pick its own image, network or limits:
 AGVISOR_HOST (ssh://user@vm; default local docker / $DOCKER_HOST), AGVISOR_IMAGE, AGVISOR_NETWORK (default "none"),
 AGVISOR_CPUS (2), AGVISOR_MEMORY (2g), AGVISOR_IDLE_TTL (600 s), AGVISOR_LIFETIME (3600 s).
+AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sandbox(egress=)), e.g.
+"pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK.
 AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot/restore
 tools exist."""
 import atexit
@@ -26,8 +28,10 @@ def _get():
     global _sb
     with _lock:
         if _sb is None:
+            egress = [e.strip() for e in (_env("EGRESS") or "").split(",") if e.strip()]
             _sb = create_sandbox(
-                _env("IMAGE"), host=_env("HOST"), network=_env("NETWORK", "none"), name=_env("NAME"),
+                _env("IMAGE"), host=_env("HOST"), name=_env("NAME"),
+                **({"egress": egress} if egress else {"network": _env("NETWORK", "none")}),
                 limits=Limits(cpus=float(_env("CPUS", 2)), memory=_env("MEMORY", "2g")),
                 idle_ttl=int(_env("IDLE_TTL", 600)), lifetime=int(_env("LIFETIME", 3600)))
         return _sb
@@ -41,7 +45,7 @@ def run(command: str, timeout: int = 120) -> str:
     that a call reports "sandbox was reset" and the files are gone (with snapshot/restore tools, only /workspace
     is kept). It cannot see the user's files: write code in with
     write_file and print what you need back. Network access is whatever the user configured
-    (off by default), so `pip install` may fail by design."""
+    (off by default, or only a few hosts), so `pip install` may fail by design."""
     try:
         sb = _get()
         # exec() refuses a timeout that could outlive the idle watchdog: keep it 7 s under

@@ -8,7 +8,9 @@ import shlex
 import subprocess
 import uuid
 from datetime import datetime
+from pathlib import Path
 
+from . import egress_proxy
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
@@ -30,6 +32,7 @@ wait_for systemctl --user is-active --quiet $S
 systemctl --user restart $S
 wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 """
+_PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
 _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
 
 
@@ -43,7 +46,7 @@ class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc"):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -61,6 +64,14 @@ class Sandbox:
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
         if owner is not None and not re.fullmatch(_ID, owner):
             raise ValueError(f"invalid owner {owner!r}: letters, digits, '_', '.', '-' only (max 63)")
+        if egress is not None:
+            if gui or network != "bridge":
+                raise ValueError("egress= makes its own private network: headless only, and don't pass network=")
+            egress = list(egress)
+            if not egress:
+                raise ValueError("egress is empty: that is network='none'")
+            egress_proxy.parse_rules(egress)  # raises ValueError on an entry it can't use
+        self.egress, self._has_egress = egress, egress is not None  # _has_egress: also true for handles from list_sandboxes()
         self.owner = owner
         self.created = None  # a datetime, set by list_sandboxes(); handles from create_sandbox() don't know it
         self.persistent = name is not None
@@ -95,7 +106,7 @@ class Sandbox:
         l = self.limits
         a = ["run", "-d", f"--runtime={self.runtime}", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
-             f"--pids-limit={l.pids}", f"--network={self.network}",
+             f"--pids-limit={l.pids}", f"--network={self._net if self.egress else self.network}",
              # gVisor caps the rootfs overlay (a file on the host disk): writes past it get ENOSPC. Per-container,
              # no daemon setting needed. `root:` only: `all:` would also overlay /workspace and stop it persisting.
              f"--annotation=dev.gvisor.flag.overlay2=root:self,size={l.disk}"]
@@ -106,6 +117,8 @@ class Sandbox:
             a.append(f"--label=agvisor.owner={self.owner}")
         if self.persistent:
             a.append(f"--label=agvisor.name={self.name.removeprefix('agvisor-')}")
+        if self.egress:
+            a += ["--label=agvisor.egress=1", "--env-file=/dev/stdin"]  # the proxy password rides on stdin, not on a command line
         if self.data_dir:  # a docker volume is a host directory: it is outside gVisor's discarded rootfs overlay
             a.append(f"--volume={self.name}:{self.data_dir}")
             if not self.gui:
@@ -148,6 +161,41 @@ class Sandbox:
         if have != (self.owner or ""):
             raise PermissionError(f"sandbox {self.name!r} belongs to another owner")
 
+    @property
+    def _net(self):  # '_' after 'agvisor': no sandbox container is called like this, whatever `name=` is
+        return f"agvisor_net_{self.name.removeprefix('agvisor-')}"
+
+    @property
+    def _proxy(self):
+        return f"agvisor_proxy_{self.name.removeprefix('agvisor-')}"
+
+    def _egress_up(self):
+        """egress=: a private network with no route out, and on it a proxy that only lets the allowlist through. The
+        proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file."""
+        if self.persistent:  # leftovers of an earlier session of this name (an expired sandbox can't clean up after itself)
+            self._docker("rm", "-f", self._proxy, check=False)
+            self._docker("network", "rm", self._net, check=False)
+        # other expired sandboxes' networks, or docker runs out of address pools. `until`: not one being set up right now
+        self._docker("network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s", check=False)
+        token = secrets.token_urlsafe(18)  # the proxy password: any other container on the bridge can reach its port
+        env = "\n".join(f"{k}={v}" for k, v in [("AGVISOR_ALLOW", ",".join(self.egress)), ("AGVISOR_TOKEN", token),
+                                                 ("AGVISOR_WATCH", self.name)]) + "\n"
+        # --rm + AGVISOR_WATCH: the proxy ends by itself once the sandbox is gone, even if we are not around to stop() it
+        self._docker("run", "-d", "--rm", f"--runtime={self.runtime}", f"--name={self._proxy}", "--env-file=/dev/stdin",
+                     "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=512", "--cap-drop=ALL",
+                     "--security-opt=no-new-privileges", "--read-only", f"--label=agvisor.egress={self.name}",
+                     _PROXY_IMAGE, "python", "-u", "-c", Path(egress_proxy.__file__).read_text(), input=env)
+        self._docker("network", "create", "--internal", "--label=agvisor.egress=1", self._net)
+        self._docker("network", "connect", "--alias=proxy", self._net, self._proxy)
+        url = f"http://agvisor:{token}@proxy:{egress_proxy.PORT}"
+        skip = "localhost,127.0.0.1,::1"
+        return "".join(f"{k}={v}\n" for k, v in [("HTTP_PROXY", url), ("HTTPS_PROXY", url), ("http_proxy", url),
+                                                 ("https_proxy", url), ("NO_PROXY", skip), ("no_proxy", skip)])
+
+    def _egress_down(self):
+        self._docker("rm", "-f", self._proxy, check=False)
+        self._docker("network", "rm", self._net, check=False)
+
     def start(self):
         if self._running:  # create_sandbox() already started it, then `with` calls start() again
             return self
@@ -157,7 +205,13 @@ class Sandbox:
         if not resumed:
             if self.persistent:  # a stopped leftover would block the name; its data lives in the volume
                 self._docker("rm", "-f", self.name, check=False)
-            self._docker(*self.run_args())
+            try:
+                env = self._egress_up() if self.egress else None
+                self._docker(*self.run_args(), input=env)
+            except BaseException:
+                if self.egress:
+                    self._egress_down()
+                raise
         self._running = True  # the container exists from here, so stop() must clean up if setup fails
         try:
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
@@ -248,6 +302,8 @@ class Sandbox:
     def stop(self):
         """Remove the container and free its CPU/RAM. A named sandbox keeps its data volume."""
         self._docker("rm", "-f", self.name, check=False)
+        if self._has_egress:
+            self._egress_down()
         self._running = False
 
     def delete(self):
@@ -321,17 +377,18 @@ def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sa
     Each has `.created` (when its container was made) and `.owner`. `owner=` lists only that owner's.
     Anonymous ones (leaked by a crashed process) are included, so this is also how you find and kill them.
     Don't start() a stopped handle: that makes a fresh default-image container."""
-    fmt = "\t".join(["{{.Names}}", "{{.State}}", '{{.Label "agvisor.name"}}', '{{.Label "agvisor.owner"}}', "{{.CreatedAt}}"])
+    fmt = "\t".join(["{{.Names}}", "{{.State}}", '{{.Label "agvisor.name"}}', '{{.Label "agvisor.owner"}}', "{{.CreatedAt}}",
+                     '{{.Label "agvisor.egress"}}'])
     out = Sandbox(host=host)._docker("ps", "-a", "--filter", "label=agvisor",
                                      *(["--filter", f"label=agvisor.owner={owner}"] if owner else []),
                                      "--format", fmt).stdout
     boxes = []
     for line in out.splitlines():
-        cname, state, label, own, created = line.split("\t")  # tabs: CreatedAt has spaces, a label can be empty
+        cname, state, label, own, created, egress = line.split("\t")  # tabs: CreatedAt has spaces, a label can be empty
         sb = Sandbox(name=label or None, owner=own or None, host=host)
         if not label:
             sb.name = cname  # anonymous: its random container name is all there is
-        sb._running = state == "running"
+        sb._running, sb._has_egress = state == "running", bool(egress)  # a proxy and a network to remove too
         sb.created = datetime.strptime(created.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")  # "... +0000 UTC": drop the zone name
         boxes.append(sb)
     return boxes
@@ -349,6 +406,7 @@ def create_sandbox(
     owner: str | None = None,
     host: str | None = None,
     runtime: str = "runsc",
+    egress: list[str] | None = None,
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
@@ -373,6 +431,12 @@ def create_sandbox(
     network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
               docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from
               reaching a gui sandbox there: use a network of its own.
+    egress   Outbound allowlist, e.g. ["pypi.org", "files.pythonhosted.org", "10.0.0.0/24:8080"]. The sandbox gets a
+              private network with no route out, and its only way out is an HTTP(S) proxy (HTTP(S)_PROXY is set) that
+              lets those hosts through: `host` or `*.host` (ports 80 and 443 unless `host:port` or `host:*`), an IPv4
+              address or a network. A name must resolve to public addresses; reaching a private one takes an IP entry.
+              Needs an image with python 3.12+ on the docker host (python:3.12-slim) for the proxy. Don't pass
+              network=. Headless only; fixed at creation, like limits.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
@@ -386,4 +450,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, owner=owner, host=host, runtime=runtime).start()
+                   name=name, owner=owner, host=host, runtime=runtime, egress=egress).start()
