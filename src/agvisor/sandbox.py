@@ -1,8 +1,10 @@
+import base64
 import codecs
 import collections
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import uuid
 from datetime import datetime
@@ -114,6 +116,9 @@ class Sandbox:
             a.append(f"--shm-size={l.shm}")
         if not self.gui:  # PID 1 is `sleep`, which never reaps orphans: they stay zombies and eat the pids limit
             a.append("--init")  # (gui: systemd is PID 1 and reaps)
+            # an image ENTRYPOINT would swallow our PID 1 command as its arguments. exec() bypasses it anyway, so
+            # clearing it loses nothing but the entrypoint's own setup script
+            a.append("--entrypoint=")
         return a + [self.image] + self._pid1()
 
     def _pid1(self):
@@ -202,6 +207,37 @@ class Sandbox:
             raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
         return r
 
+    def put(self, path, data: bytes, *, timeout=120):
+        """Write `data` to `path` inside: parent directories are created, an existing file is replaced. Goes through
+        exec() (base64 on stdin: any bytes survive, a dead sandbox raises SandboxGone). Relative paths start in
+        /workspace for a named sandbox. Needs GNU coreutils, like exec(timeout)."""
+        q = shlex.quote(path)
+        r = self.exec(f'mkdir -p -- "$(dirname -- {q})" && base64 -d > {q}', input=base64.b64encode(data).decode(), timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"put {path!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def get(self, path, *, max_bytes=10_000_000, timeout=120):
+        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
+        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+        out, size = [], 0
+        limit = 4 * (max_bytes // 3 + 2)  # base64 characters of max_bytes+1 bytes; a sandbox that sends more is lying
+
+        def keep(text):
+            nonlocal size
+            size += len(text)
+            if size <= limit:
+                out.append(text)
+
+        q = shlex.quote(path)
+        r = self.exec(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
+                      timeout=timeout, on_output=keep)  # on_output: bounded memory, stderr merged into the same stream
+        if r.returncode:
+            raise RuntimeError(f"get {path!r} failed (exit {r.returncode}): {r.stdout.strip()[-300:]}")
+        data = None if size > limit else base64.b64decode("".join(out), validate=True)
+        if data is None or len(data) > max_bytes:
+            raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
+        return data
+
     def desktop_token(self, key: bytes, ttl=300):
         """Token for <agvisor-desktop>. Mint it server-side only: it carries the RDP password.
         Replayable until `ttl` runs out."""
@@ -247,6 +283,19 @@ class Sandbox:
         except BaseException:
             self._docker("volume", "rm", "-f", snap, check=False)  # a half-copied snapshot must not be restorable
             raise
+
+    def list_snapshots(self):
+        """Tags of this sandbox's snapshots, sorted. Named sandboxes only; the owner check applies."""
+        prefix = self._snap_volume("x").removesuffix("x")  # validates persistence, and gives the volume-name prefix
+        self._claim_volume()
+        vols = self._docker("volume", "ls", "-q", "--filter", f"label=agvisor.snap={self.name}").stdout.split()
+        return sorted(v.removeprefix(prefix) for v in vols)
+
+    def delete_snapshot(self, tag):
+        """Remove snapshot `tag` and free its disk. Not an error if it doesn't exist."""
+        snap = self._snap_volume(tag)
+        self._claim_volume()
+        self._docker("volume", "rm", "-f", snap)
 
     def restore(self, tag):
         """Put the data dir back to snapshot `tag`: whatever is in it now is erased. The container is replaced by a

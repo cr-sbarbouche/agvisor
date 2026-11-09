@@ -1,4 +1,8 @@
+import base64
+import contextlib
+import io
 import os
+import shlex
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -15,6 +19,9 @@ def test_headless():
     assert "--privileged" not in a and a[-2:] == ["sleep", "infinity"]
     assert "--init" in a  # a real PID 1 reaps orphans; `sleep` would leave zombies that eat the pids limit
     assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=5g" in a  # default disk cap
+    assert "--entrypoint=" in a  # an image ENTRYPOINT would take `sleep infinity` as its arguments
+    assert a.index("--entrypoint=") < a.index("ubuntu:24.04")  # a docker flag only works before the image
+    assert not any(x.startswith("--entrypoint") for x in Sandbox(gui=True).run_args())  # systemd image: its own PID 1
     a = Sandbox(limits=Limits(disk="100M"), gui=True).run_args()
     assert "--annotation=dev.gvisor.flag.overlay2=root:self,size=100M" in a  # gui too; root only, never `all:`
 
@@ -105,9 +112,9 @@ def test_lifetime_and_validation():
         raise AssertionError(f"accepted {bad}")
 
 
-def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner=""):
+def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner="", vols=""):
     """Patchable subprocess.run: records commands; `fail` = words that make a command exit 1;
-    `volume_owner` = the agvisor.owner label that `docker volume inspect` reports."""
+    `volume_owner` = the agvisor.owner label that `docker volume inspect` reports; `vols` = `docker volume ls -q`."""
     calls = []
 
     def run(cmd, **_):
@@ -115,6 +122,8 @@ def fake_docker(inspect_out="", fail=(), ps_out="", volume_owner=""):
         out = {"inspect": inspect_out, "port": "127.0.0.1:49153\n", "ps": ps_out}.get(cmd[1], "")
         if cmd[1:3] == ["volume", "inspect"]:
             out = volume_owner + "\n"
+        if cmd[1:3] == ["volume", "ls"]:
+            out = vols
         bad = any(w in cmd for w in fail)
         return subprocess.CompletedProcess(cmd, 1 if bad else 0, out, "boom" if bad else "")
 
@@ -213,6 +222,36 @@ def test_snapshot_and_restore():
         except ValueError:
             continue
         raise AssertionError(f"accepted tag {tag!r}")
+
+
+def test_list_and_delete_snapshot():
+    prefix = "agvisor_snap_proj."
+    calls, run = fake_docker(vols=f"{prefix}b\n{prefix}a-1\n")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        assert Sandbox(name="proj").list_snapshots() == ["a-1", "b"]
+        assert calls[-1][1:] == ["volume", "ls", "-q", "--filter", "label=agvisor.snap=agvisor-proj"]
+        calls.clear()
+        Sandbox(name="proj").delete_snapshot("b")
+        assert calls[-1][1:] == ["volume", "rm", "-f", prefix + "b"]  # -f: deleting one that is already gone is fine
+
+    calls, run = fake_docker(volume_owner="u42")  # another owner: refused, nothing listed or removed
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        for act, args in (("list_snapshots", ()), ("delete_snapshot", ("b",))):
+            try:
+                getattr(Sandbox(name="proj", owner="other"), act)(*args)
+            except PermissionError:
+                continue
+            raise AssertionError(f"{act} ignored the owner")
+    assert not any(c[1:3] in (["volume", "ls"], ["volume", "rm"]) for c in calls)
+
+    # anonymous (no volume), and a tag that would end up in a volume name
+    for sb, act, args in ((Sandbox(), "list_snapshots", ()), (Sandbox(), "delete_snapshot", ("b",)),
+                          (Sandbox(name="proj"), "delete_snapshot", ("a.b",))):
+        try:
+            getattr(sb, act)(*args)
+        except ValueError:
+            continue
+        raise AssertionError(f"{act}{args} was accepted")
 
 
 def test_failed_resume_keeps_the_container():
@@ -366,6 +405,103 @@ def test_exec_streams_output():
     raise AssertionError("accepted stdin together with on_output")
 
 
+def test_put_and_get():
+    sb, seen = Sandbox(), []
+    odd = "dir/a b;rm -rf x.bin"  # the path goes through a shell: it must arrive quoted
+    sb._docker = lambda *a, input=None, **_: (seen.append((a, input)), subprocess.CompletedProcess(a, 0, "", ""))[1]
+    sb.put(odd, b"\x00\xff bytes")
+    cmd = seen[0][0][-1]
+    assert shlex.quote(odd) in cmd and base64.b64decode(seen[0][1]) == b"\x00\xff bytes"  # stdin carries the data, any bytes
+    sb._docker = lambda *a, **_: subprocess.CompletedProcess(a, 1, "", "sh: write error: No space left on device")
+    try:
+        sb.put("x", b"1")
+    except RuntimeError as e:
+        assert "No space left" in str(e)
+    else:
+        raise AssertionError("a failed write must raise")
+    sb._docker = lambda *a, **_: subprocess.CompletedProcess(a, 1, "", "Error response from daemon: No such container: agvisor-x")
+    try:
+        sb.put("x", b"1")
+    except SandboxGone:
+        pass
+    else:
+        raise AssertionError("a dead sandbox must raise SandboxGone")
+
+    def stream(*chunks, rc=0):  # what the sandbox prints, as docker exec would deliver it
+        def f(*a, on_output, **_):
+            for c in chunks:
+                on_output(c)
+            return subprocess.CompletedProcess(a, rc, "".join(chunks), "")
+        return f
+
+    b64 = lambda n: base64.b64encode(b"z" * n).decode()
+    sb._stream = stream("AAH/", "YWJj")  # split in the middle of the data
+    assert sb.get("f") == b"\x00\x01\xffabc"
+    sb._stream = stream()
+    assert sb.get("empty") == b""
+    sb._stream = stream(b64(30))
+    assert sb.get("f", max_bytes=30) == b"z" * 30  # exactly the cap: fine
+    for evil in (b64(31), "A" * 10_000, "not base64!"):  # one byte over / a sandbox that floods us / junk
+        sb._stream = stream(evil)
+        try:
+            sb.get("f", max_bytes=30)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {evil[:12]!r}")
+    sb._stream = stream("not a file: nope\n", rc=1)
+    try:
+        sb.get("nope")
+    except RuntimeError as e:
+        assert "not a file: nope" in str(e)
+    else:
+        raise AssertionError("a missing file must raise")
+
+
+def test_cli():
+    from agvisor import cli
+
+    def main(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = cli.main(list(argv))
+            except SystemExit as e:  # argparse errors
+                rc = e.code
+        return rc, out.getvalue()
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+    ps = ("agvisor-old\trunning\told\tu42\t2026-11-06 09:28:33 +0000 UTC\n"
+          f"agvisor-new\texited\tnew\t\t{now}\n")
+
+    def run(*argv, **kw):
+        calls, fake = fake_docker(ps_out=ps, **kw)
+        with mock.patch("agvisor.sandbox.subprocess.run", fake):
+            rc, out = main(*argv)
+        return rc, out, [c[1:] for c in calls[1:]]  # calls[0] is the `ps`
+
+    rc, out, _ = run("ls")
+    assert rc == 0 and out.splitlines() == ["agvisor-old\trunning\tu42\t2026-11-06T09:28:33+00:00",
+                                           f"agvisor-new\tstopped\t-\t{now[:10]}T{now[11:19]}+00:00"]
+    assert run("ls", "--owner", "u42")[0] == 0
+    assert run("rm")[2] == [] and run("rm")[0] == 2  # no selector: refuses instead of removing everything
+    assert run("rm", "nope")[0] == 2
+    rc, out, calls = run("rm", "--older-than", "3600")  # only the old one; its volume stays
+    assert (rc, out, calls) == (0, "removed agvisor-old\n", [["rm", "-f", "agvisor-old"]])
+    rc, out, calls = run("rm", "agvisor-old", "--data")
+    assert out == "removed agvisor-old\n" and ["volume", "rm", "-f", "agvisor-old"] in calls  # --data erases the files too
+    assert run("rm", "agvisor-new", "--older-than", "3600")[1] == ""  # both conditions must hold
+
+    def stream(self, *a, on_output):
+        on_output("hi\n")
+        return subprocess.CompletedProcess(a, 3, "hi\n", "")
+
+    with mock.patch.object(Sandbox, "_stream", stream):
+        calls, fake = fake_docker(ps_out=ps)
+        with mock.patch("agvisor.sandbox.subprocess.run", fake):
+            assert main("exec", "agvisor-old", "echo", "hi") == (3, "hi\n")  # the command's exit code, output as it comes
+            assert main("exec", "agvisor-new", "echo")[0] == 2  # stopped: nothing to run in
+
+
 def test_mcp_server():
     from agvisor import mcp_server as m
 
@@ -383,6 +519,12 @@ def test_mcp_server():
 
         def stop(self):
             self.stopped = True
+
+        def snapshot(self, tag):
+            self.calls.append(("snapshot", tag))
+
+        def restore(self, tag):
+            self.calls.append(("restore", tag))
 
     boxes, kws = [], []
 
@@ -406,6 +548,42 @@ def test_mcp_server():
         msg = m.run("x")  # sandbox 2 is dead: the agent is told, nothing is silently re-run
         assert msg.startswith("sandbox was reset") and boxes[1].stopped and m._sb is None and len(boxes) == 2
         assert m.run("y").endswith("[exit 3]") and len(boxes) == 3  # the next call gets a fresh one
+        assert kws[0]["name"] is None  # anonymous unless AGVISOR_NAME says otherwise
+    m._sb = None
+
+    # AGVISOR_NAME: a named sandbox, whose /workspace the checkpoint tools save and roll back
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
+        assert m.snapshot() == "checkpoint saved" and kws[0]["name"] == "proj"
+        assert "restarted" in m.restore()
+        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]  # one fixed slot: no tag from the agent
+        m._sb = None
+        assert "Only /workspace is kept" in m.run("x")  # boxes[1] is the one that dies; its files are not all gone
+    m._sb = None
+
+
+def test_mcp_write_file():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        def __init__(self, gone):
+            self.gone, self.puts, self.stopped = gone, [], False
+
+        def put(self, path, data):
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            self.puts.append((path, data))
+
+        def stop(self):
+            self.stopped = True
+
+    boxes = []
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: boxes.append(Fake(len(boxes) == 1)) or boxes[-1]):
+        assert m.write_file("/tmp/a.py", "caf\u00e9") == "wrote 5 bytes to /tmp/a.py"  # bytes, not characters
+        assert boxes[0].puts == [("/tmp/a.py", "caf\u00e9".encode())]
+        m.reset()
+        assert m.write_file("/tmp/b", "x").startswith("sandbox was reset") and boxes[1].stopped and m._sb is None
     m._sb = None
 
 
@@ -435,12 +613,16 @@ if __name__ == "__main__":
     test_named_sandbox_mounts_volume()
     test_resume_and_delete()
     test_snapshot_and_restore()
+    test_list_and_delete_snapshot()
     test_failed_resume_keeps_the_container()
     test_idle_ttl()
     test_list_sandboxes()
     test_owner()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
+    test_put_and_get()
+    test_cli()
     test_mcp_server()
+    test_mcp_write_file()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")

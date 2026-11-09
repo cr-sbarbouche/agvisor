@@ -72,7 +72,7 @@ sb.stop()                                      # without `with`, you stop it you
 | `name` | makes the sandbox resumable, see below |
 | `host` | `None` = docker on this machine (or `$DOCKER_HOST`); `"ssh://user@host"` = docker on a remote VM/server |
 
-`sb.exec(cmd, input=None, timeout=120)` runs `sh -c cmd` inside and returns a `CompletedProcess`; on timeout the command is killed and `returncode` is 124. That relies on GNU `timeout`, so use Debian/Ubuntu-based images (`python:3.12-slim`, `ubuntu`). On Alpine (busybox) the code is 143 and only the shell is killed: the children of a compound command (`a; b`) keep running. Also don't set an `ENTRYPOINT` in your image: agvisor starts it with `sleep infinity` as arguments.
+`sb.exec(cmd, input=None, timeout=120)` runs `sh -c cmd` inside and returns a `CompletedProcess`; on timeout the command is killed and `returncode` is 124. That relies on GNU `timeout`, so use Debian/Ubuntu-based images (`python:3.12-slim`, `ubuntu`). On Alpine (busybox) the code is 143 and only the shell is killed: the children of a compound command (`a; b`) keep running. An image's `ENTRYPOINT` is ignored: agvisor clears it for headless sandboxes, because it would take agvisor's own `sleep infinity` as arguments (`exec` never ran it anyway). If your entrypoint script did setup work, that no longer happens.
 
 Under gVisor, the limits behave differently from plain docker (checked on real `runsc`):
 - `pids` budgets the sandbox runtime's *host threads*, not guest processes: an idle sandbox already uses ~35. Keep the default (512): at 64–128, a fork storm made `fork` fail with `Out of memory` and, pushed harder, killed the sandbox.
@@ -103,7 +103,7 @@ with create_sandbox("python:3.12", name="my-project") as sb:
     sb.restore("clean")                             # /workspace is exactly as it was; new container, processes lost
 ```
 
-- `snapshot(tag)` replaces a snapshot of the same tag; `restore(tag)` erases whatever is in the data dir now. `delete()` removes the snapshots with the sandbox. Tags: letters, digits, `_`, `-`.
+- `snapshot(tag)` replaces a snapshot of the same tag; `restore(tag)` erases whatever is in the data dir now. `list_snapshots()` returns the tags, `delete_snapshot(tag)` frees one, and `delete()` removes them all with the sandbox. Tags: letters, digits, `_`, `-`.
 - Named sandboxes only, and the owner check applies. The copy runs in a throwaway gVisor container from the sandbox's image (it needs `sh`, `rm`, `cp`), with no network.
 - Each snapshot costs as much host disk as the data dir, and has no size cap either. Stop writing before `snapshot()`: a copy taken during writes can be inconsistent.
 
@@ -114,6 +114,15 @@ with create_sandbox("python:3.12", name="my-project") as sb:
 
 For a remote host the RDP port is on that host's `127.0.0.1`: tunnel it with `ssh -L`.
 `network="none"` cuts network access (headless only: GUI needs the published port).
+
+### Files in and out
+
+```python
+sb.put("/tmp/job/input.csv", open("input.csv", "rb").read())   # parent dirs are created, an existing file is replaced
+data = sb.get("/tmp/job/result.json")                          # bytes; a relative path starts in /workspace for a named sandbox
+```
+
+Both go through `exec()` (base64 over stdin/stdout), so they need GNU coreutils in the image (Debian/Ubuntu), raise `SandboxGone` if the sandbox is dead and `RuntimeError` if the write or read fails. `get()` reads regular files only and raises `ValueError` past `max_bytes` (default 10 MB): the sandbox is untrusted, so what comes out of it is capped. `tests/test_files.py` runs both against a real container.
 
 ### Expiry and cleanup
 
@@ -130,13 +139,14 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 - `list_sandboxes()` also finds anonymous sandboxes left behind by a crashed process. Don't `start()` a stopped handle: it would make a fresh default-image container.
 - `sb.created` is a timezone-aware `datetime` (second precision) of when the container was made, so a retention job can stop what is older than it should be: `[sb.stop() for sb in list_sandboxes() if now - sb.created > max_age]`. Sandboxes from `create_sandbox()` have `created = None`.
 - `owner=` tags a sandbox, e.g. with a tenant id: `create_sandbox(name="u42-scan7", owner="u42")`, and `list_sandboxes(owner="u42")` lists only theirs. See the `name=` note under Security for what it does and doesn't protect.
+- `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code. A retention job is `agvisor rm --older-than 14400` in cron. `exec` doesn't count as activity for `idle_ttl`.
 
 ## Coding agents (skill + MCP server)
 
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
 
 - **Skill**, [`.claude/skills/agvisor/SKILL.md`](https://github.com/cr-sbarbouche/agvisor/blob/main/.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
-- **MCP server**, `agvisor-mcp`: two tools, `run(command, timeout)` and `reset()`, so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
+- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)` and `reset()` (plus `snapshot()`/`restore()`, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
 
 Settings are environment variables, so the agent can't pick its own image, network or limits:
 
@@ -147,8 +157,11 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
+| `AGVISOR_NAME` | unset. Set it and `/workspace` is kept in a docker volume, and two more tools appear (below) |
 
-The sandbox is anonymous: no `/workspace` volume, so nothing is shared between projects, and the sandbox can't see your files (the agent writes code in with a heredoc). Claude Code:
+By default the sandbox is anonymous: no `/workspace` volume, so nothing is shared between projects, and the sandbox can't see your files (the agent writes code in with `write_file`).
+
+With `AGVISOR_NAME=my-project` the agent also gets `snapshot()` and `restore()`: one checkpoint of `/workspace` it can save and roll back to, e.g. before a risky `pip install`. `reset()` then keeps `/workspace` (use `restore()` to roll that back). Mind the cost: `/workspace` is a volume with no size cap, shared by every server process that uses that name, and the checkpoint is a second full copy of it. Claude Code:
 
 ```sh
 claude mcp add agvisor -e AGVISOR_HOST=ssh://user@my-vm -- uvx --from 'agvisor[mcp]' agvisor-mcp

@@ -27,6 +27,11 @@ try:
     else:
         raise AssertionError("restored a snapshot that does not exist")
     assert sb.exec("cat venv/bin/tool").stdout.strip() == "good"  # the failed restore wiped nothing
+    sb.snapshot("other")
+    assert sb.list_snapshots() == ["clean", "other"]
+    sb.delete_snapshot("other")
+    sb.delete_snapshot("other")  # already gone: fine
+    assert sb.list_snapshots() == ["clean"]
 finally:
     sb.delete()  # volumes too, even when an assert failed
 print("ok")
