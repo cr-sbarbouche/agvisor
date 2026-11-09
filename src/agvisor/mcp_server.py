@@ -40,17 +40,32 @@ def run(command: str, timeout: int = 120) -> str:
     The same sandbox is reused between calls (files, installed packages) until it has been idle for a while; after
     that a call reports "sandbox was reset" and the files are gone (with snapshot/restore tools, only /workspace
     is kept). It cannot see the user's files: write code in with
-    a heredoc (`cat > a.py <<'EOF'`) and print what you need back. Network access is whatever the user configured
+    write_file and print what you need back. Network access is whatever the user configured
     (off by default), so `pip install` may fail by design."""
     try:
         sb = _get()
         # exec() refuses a timeout that could outlive the idle watchdog: keep it 7 s under
         r = sb.exec(command, timeout=max(1, min(timeout, sb.idle_ttl - 7)), on_output=lambda _: None)  # streaming bounds memory
     except SandboxGone as e:
-        reset()  # no silent retry: the command may have half-run, and the agent should know what is gone
-        kept = "Only /workspace is kept" if _env("NAME") else "Its files are gone"
-        return f"sandbox was reset ({e}). {kept}; set up again and re-run."
+        return _gone(e)
     return f"{r.stdout[-_MAX:]}\n[exit {r.returncode}]"
+
+
+def _gone(e):
+    reset()  # no silent retry: the command may have half-run, and the agent should know what is gone
+    kept = "Only /workspace is kept" if _env("NAME") else "Its files are gone"
+    return f"sandbox was reset ({e}). {kept}; set up again and retry."
+
+
+def write_file(path: str, content: str) -> str:
+    """Write a text file (UTF-8) inside the sandbox: parent directories are created, an existing file is replaced.
+    Use it instead of a heredoc, which breaks on quoting and on very long content. Use an absolute path
+    (/tmp/a.py, or /workspace/a.py when the sandbox keeps /workspace)."""
+    try:
+        _get().put(path, content.encode())
+    except SandboxGone as e:
+        return _gone(e)
+    return f"wrote {len(content.encode())} bytes to {path}"
 
 
 def reset() -> str:
@@ -85,6 +100,7 @@ def main():
         raise SystemExit("agvisor-mcp needs the mcp extra (mcp>=2): pip install 'agvisor[mcp]'")
     app = MCPServer("agvisor")
     app.tool()(run)
+    app.tool()(write_file)
     app.tool()(reset)
     if _env("NAME"):  # snapshots need a named sandbox
         app.tool()(snapshot)

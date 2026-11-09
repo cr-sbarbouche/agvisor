@@ -1,8 +1,10 @@
+import base64
 import codecs
 import collections
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import uuid
 from datetime import datetime
@@ -204,6 +206,37 @@ class Sandbox:
                                          and ("is not running" in msg or "no such container" in msg)):
             raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
         return r
+
+    def put(self, path, data: bytes, *, timeout=120):
+        """Write `data` to `path` inside: parent directories are created, an existing file is replaced. Goes through
+        exec() (base64 on stdin: any bytes survive, a dead sandbox raises SandboxGone). Relative paths start in
+        /workspace for a named sandbox. Needs GNU coreutils, like exec(timeout)."""
+        q = shlex.quote(path)
+        r = self.exec(f'mkdir -p -- "$(dirname -- {q})" && base64 -d > {q}', input=base64.b64encode(data).decode(), timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"put {path!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def get(self, path, *, max_bytes=10_000_000, timeout=120):
+        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
+        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+        out, size = [], 0
+        limit = 4 * (max_bytes // 3 + 2)  # base64 characters of max_bytes+1 bytes; a sandbox that sends more is lying
+
+        def keep(text):
+            nonlocal size
+            size += len(text)
+            if size <= limit:
+                out.append(text)
+
+        q = shlex.quote(path)
+        r = self.exec(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
+                      timeout=timeout, on_output=keep)  # on_output: bounded memory, stderr merged into the same stream
+        if r.returncode:
+            raise RuntimeError(f"get {path!r} failed (exit {r.returncode}): {r.stdout.strip()[-300:]}")
+        data = None if size > limit else base64.b64decode("".join(out), validate=True)
+        if data is None or len(data) > max_bytes:
+            raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
+        return data
 
     def desktop_token(self, key: bytes, ttl=300):
         """Token for <agvisor-desktop>. Mint it server-side only: it carries the RDP password.

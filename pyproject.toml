@@ -29,6 +29,7 @@ web = ["cryptography>=42"]  # only for Sandbox.desktop_token()
 mcp = ["mcp>=2"]  # only for the agvisor-mcp server; 2.x renamed FastMCP to MCPServer, so 1.x won't do
 
 [project.scripts]
+agvisor = "agvisor.cli:main"
 agvisor-mcp = "agvisor.mcp_server:main"
 
 [build-system]

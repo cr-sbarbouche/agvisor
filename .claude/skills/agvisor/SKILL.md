@@ -7,11 +7,11 @@ description: "Run untrusted or risky code in a gVisor sandbox instead of on the 
 
 gVisor (`runsc`) sandboxes with CPU/memory/pids/disk limits, driven through the `docker` CLI. Alpha, not security-audited: tell the user that before running code that is actively hostile.
 
-## With the `agvisor` MCP tools (`run`, `reset`; `snapshot`, `restore` when the user set `AGVISOR_NAME`)
+## With the `agvisor` MCP tools (`run`, `write_file`, `reset`; `snapshot`, `restore` when the user set `AGVISOR_NAME`)
 
 - Use `run` for every command that executes code you did not write or cannot vouch for. If it fails, tell the user. Don't fall back to the host shell.
 - One sandbox lives between calls (files, installed packages) until it has been idle ~10 minutes. Then `run` reports "sandbox was reset" and the files are gone: set up again.
-- It can't see the user's files. Put code in with a heredoc (`cat > /tmp/a.py <<'EOF'`; there is no `/workspace` here), print what you need back.
+- It can't see the user's files. Put code in with `write_file` (an absolute path such as `/tmp/a.py`; there is no `/workspace` here), print what you need back.
 - Network is off unless the user set `AGVISOR_NETWORK`. If `pip install` fails for that reason, ask them. Don't work around it.
 - Going over memory or the process limit kills the whole sandbox, not one process. Expect "sandbox was reset".
 - With `snapshot`/`restore`: `/workspace` is kept across resets. Call `snapshot` before a risky install or rewrite, `restore` to undo it (one checkpoint; it erases the current `/workspace`).

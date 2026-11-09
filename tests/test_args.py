@@ -1,4 +1,8 @@
+import base64
+import contextlib
+import io
 import os
+import shlex
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -401,6 +405,103 @@ def test_exec_streams_output():
     raise AssertionError("accepted stdin together with on_output")
 
 
+def test_put_and_get():
+    sb, seen = Sandbox(), []
+    odd = "dir/a b;rm -rf x.bin"  # the path goes through a shell: it must arrive quoted
+    sb._docker = lambda *a, input=None, **_: (seen.append((a, input)), subprocess.CompletedProcess(a, 0, "", ""))[1]
+    sb.put(odd, b"\x00\xff bytes")
+    cmd = seen[0][0][-1]
+    assert shlex.quote(odd) in cmd and base64.b64decode(seen[0][1]) == b"\x00\xff bytes"  # stdin carries the data, any bytes
+    sb._docker = lambda *a, **_: subprocess.CompletedProcess(a, 1, "", "sh: write error: No space left on device")
+    try:
+        sb.put("x", b"1")
+    except RuntimeError as e:
+        assert "No space left" in str(e)
+    else:
+        raise AssertionError("a failed write must raise")
+    sb._docker = lambda *a, **_: subprocess.CompletedProcess(a, 1, "", "Error response from daemon: No such container: agvisor-x")
+    try:
+        sb.put("x", b"1")
+    except SandboxGone:
+        pass
+    else:
+        raise AssertionError("a dead sandbox must raise SandboxGone")
+
+    def stream(*chunks, rc=0):  # what the sandbox prints, as docker exec would deliver it
+        def f(*a, on_output, **_):
+            for c in chunks:
+                on_output(c)
+            return subprocess.CompletedProcess(a, rc, "".join(chunks), "")
+        return f
+
+    b64 = lambda n: base64.b64encode(b"z" * n).decode()
+    sb._stream = stream("AAH/", "YWJj")  # split in the middle of the data
+    assert sb.get("f") == b"\x00\x01\xffabc"
+    sb._stream = stream()
+    assert sb.get("empty") == b""
+    sb._stream = stream(b64(30))
+    assert sb.get("f", max_bytes=30) == b"z" * 30  # exactly the cap: fine
+    for evil in (b64(31), "A" * 10_000, "not base64!"):  # one byte over / a sandbox that floods us / junk
+        sb._stream = stream(evil)
+        try:
+            sb.get("f", max_bytes=30)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {evil[:12]!r}")
+    sb._stream = stream("not a file: nope\n", rc=1)
+    try:
+        sb.get("nope")
+    except RuntimeError as e:
+        assert "not a file: nope" in str(e)
+    else:
+        raise AssertionError("a missing file must raise")
+
+
+def test_cli():
+    from agvisor import cli
+
+    def main(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = cli.main(list(argv))
+            except SystemExit as e:  # argparse errors
+                rc = e.code
+        return rc, out.getvalue()
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+    ps = ("agvisor-old\trunning\told\tu42\t2026-11-06 09:28:33 +0000 UTC\n"
+          f"agvisor-new\texited\tnew\t\t{now}\n")
+
+    def run(*argv, **kw):
+        calls, fake = fake_docker(ps_out=ps, **kw)
+        with mock.patch("agvisor.sandbox.subprocess.run", fake):
+            rc, out = main(*argv)
+        return rc, out, [c[1:] for c in calls[1:]]  # calls[0] is the `ps`
+
+    rc, out, _ = run("ls")
+    assert rc == 0 and out.splitlines() == ["agvisor-old\trunning\tu42\t2026-11-06T09:28:33+00:00",
+                                           f"agvisor-new\tstopped\t-\t{now[:10]}T{now[11:19]}+00:00"]
+    assert run("ls", "--owner", "u42")[0] == 0
+    assert run("rm")[2] == [] and run("rm")[0] == 2  # no selector: refuses instead of removing everything
+    assert run("rm", "nope")[0] == 2
+    rc, out, calls = run("rm", "--older-than", "3600")  # only the old one; its volume stays
+    assert (rc, out, calls) == (0, "removed agvisor-old\n", [["rm", "-f", "agvisor-old"]])
+    rc, out, calls = run("rm", "agvisor-old", "--data")
+    assert out == "removed agvisor-old\n" and ["volume", "rm", "-f", "agvisor-old"] in calls  # --data erases the files too
+    assert run("rm", "agvisor-new", "--older-than", "3600")[1] == ""  # both conditions must hold
+
+    def stream(self, *a, on_output):
+        on_output("hi\n")
+        return subprocess.CompletedProcess(a, 3, "hi\n", "")
+
+    with mock.patch.object(Sandbox, "_stream", stream):
+        calls, fake = fake_docker(ps_out=ps)
+        with mock.patch("agvisor.sandbox.subprocess.run", fake):
+            assert main("exec", "agvisor-old", "echo", "hi") == (3, "hi\n")  # the command's exit code, output as it comes
+            assert main("exec", "agvisor-new", "echo")[0] == 2  # stopped: nothing to run in
+
+
 def test_mcp_server():
     from agvisor import mcp_server as m
 
@@ -461,6 +562,31 @@ def test_mcp_server():
     m._sb = None
 
 
+def test_mcp_write_file():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        def __init__(self, gone):
+            self.gone, self.puts, self.stopped = gone, [], False
+
+        def put(self, path, data):
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            self.puts.append((path, data))
+
+        def stop(self):
+            self.stopped = True
+
+    boxes = []
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: boxes.append(Fake(len(boxes) == 1)) or boxes[-1]):
+        assert m.write_file("/tmp/a.py", "caf\u00e9") == "wrote 5 bytes to /tmp/a.py"  # bytes, not characters
+        assert boxes[0].puts == [("/tmp/a.py", "caf\u00e9".encode())]
+        m.reset()
+        assert m.write_file("/tmp/b", "x").startswith("sandbox was reset") and boxes[1].stopped and m._sb is None
+    m._sb = None
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -494,6 +620,9 @@ if __name__ == "__main__":
     test_owner()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
+    test_put_and_get()
+    test_cli()
     test_mcp_server()
+    test_mcp_write_file()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
