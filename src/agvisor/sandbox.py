@@ -426,7 +426,7 @@ class Sandbox:
 
         r = self.exec(script, timeout=timeout, on_output=keep)  # on_output: bounded memory
         if r.returncode:
-            raise RuntimeError(f"exit {r.returncode}: {r.stdout.strip()[-300:]}")
+            raise RuntimeError(f"(exit {r.returncode}): {r.stdout.strip()[-300:]}")
         data = None if size > limit else base64.b64decode("".join(out), validate=True)
         return data if data is not None and len(data) <= max_bytes else None
 
@@ -438,7 +438,7 @@ class Sandbox:
             data = self._b64(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
                              max_bytes, timeout)
         except RuntimeError as e:
-            raise RuntimeError(f"get {path!r} failed ({e})") from None
+            raise RuntimeError(f"get {path!r} failed {e}") from None
         if data is None:
             raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
         return data
