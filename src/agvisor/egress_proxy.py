@@ -1,8 +1,7 @@
 """Allowlist HTTP(S) proxy that agvisor runs in a container next to an `egress=` sandbox. Stdlib only, one file: agvisor
 passes this source to `python -c` in a stock python image, and imports it to validate `egress=` entries.
 
-Environment: AGVISOR_ALLOW (comma-separated entries), AGVISOR_TOKEN (the proxy password), AGVISOR_WATCH (optional: a
-name to resolve every 5 s; once it has resolved and then stops resolving twice, this process exits).
+Environment: AGVISOR_ALLOW (comma-separated entries), AGVISOR_TOKEN (the proxy password).
 
 Entry grammar, `host[:port]`: port defaults to 80 and 443, `*` = any port.
   example.com      exactly that name         *.example.com   its subdomains, not example.com itself
@@ -163,24 +162,8 @@ async def serve(rules, token, host="0.0.0.0", port=PORT):
     return await asyncio.start_server(handle, host, port, limit=2**14)
 
 
-async def _watch(name):
-    loop, seen, misses, give_up = asyncio.get_running_loop(), False, 0, 0
-    give_up = loop.time() + 1800  # the sandbox never showed up (its start failed): don't linger
-    while True:
-        await asyncio.sleep(5)
-        try:
-            await loop.getaddrinfo(name, None)
-            seen, misses = True, 0
-        except OSError:
-            misses += 1
-        if (seen and misses >= 2) or (not seen and loop.time() > give_up):
-            os._exit(0)
-
-
 async def main():
     server = await serve(parse_rules(os.environ["AGVISOR_ALLOW"].split(",")), os.environ["AGVISOR_TOKEN"])
-    if os.environ.get("AGVISOR_WATCH"):
-        asyncio.create_task(_watch(os.environ["AGVISOR_WATCH"]))
     await server.serve_forever()
 
 
