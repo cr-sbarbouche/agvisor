@@ -31,6 +31,13 @@ try:
     assert "No such file" in m.list_files("/nope") and "cannot read" in m.read_file("/nope")
     m.run("head -c 100 /dev/zero > /tmp/z")
     assert "is binary" in m.read_file("/tmp/z")
+    assert m.edit_file("/tmp/a b.txt", "caf", "tea") == "edited /tmp/a b.txt" and m.read_file("/tmp/a b.txt") == "tea\u00e9\n"
+    assert m.edit_file("/tmp/a b.txt", "zzz", "x") == "old text not found in /tmp/a b.txt"
+
+    # the python session: the interpreter has to outlive each exec(), and the alarm has to reach a Python loop
+    assert m.python("x = 41").startswith("[new python session") and m.python("x + 1") == "42\n"
+    assert "TimeoutError" in m.python("import time\nwhile True: time.sleep(0.1)", timeout=2) and m.python("x") == "41\n"
+    assert "NameError" in m.python("x", restart=True)
 
     job = m.start_job("echo one; sleep 2; echo \"t'wo\"")
     out = until(job, "[exit 0")
