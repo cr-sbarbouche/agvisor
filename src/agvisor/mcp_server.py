@@ -1,4 +1,4 @@
-"""MCP server: a coding agent runs shell commands in a gVisor sandbox instead of on the host.
+"""MCP server: a coding agent runs shell commands, edits files and runs Python in a gVisor sandbox instead of on the host.
 
 Configured by environment variables only, so the agent can't pick its own image, network or limits:
 AGVISOR_HOST (ssh://user@vm; default local docker / $DOCKER_HOST), AGVISOR_IMAGE, AGVISOR_NETWORK (default "none"),
@@ -11,12 +11,15 @@ import atexit
 import os
 import shlex
 import threading
+from pathlib import Path
 
 from .limits import Limits
 from .sandbox import Job, SandboxGone, create_sandbox
 
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
 _READ = 100_000  # read_file(): bytes of one file
+_EDIT = 1_000_000  # edit_file(): bytes of one file
+_PYSESSION = Path(__file__).with_name("_pysession.py").read_text()  # sent along with every python() call
 _CHECKPOINT = "checkpoint"  # ponytail: one snapshot slot, so an agent can't pile up full copies of /workspace
 _sb = None  # One sandbox per server process. Anonymous unless AGVISOR_NAME is set: then /workspace is a volume with
 _lock = threading.Lock()  # no size cap, shared by every server process using that name.
@@ -91,6 +94,56 @@ def read_file(path: str) -> str:
     except ValueError:
         return f"{path} is bigger than {_READ} bytes: use run() with head, tail or grep"
     return f"{path} is binary ({len(data)} bytes)" if b"\0" in data else data.decode(errors="replace")
+
+
+def edit_file(path: str, old: str, new: str) -> str:
+    """Replace one exact piece of text in a UTF-8 file inside the sandbox. Cheaper and safer than sending the whole
+    file again with write_file(). `old` must appear exactly once: include the lines around it to make it unique. Use
+    an absolute path, or one relative to /workspace when the sandbox keeps /workspace."""
+    if not old:
+        return "old must not be empty: use write_file() to create a file"
+    try:
+        sb = _get()
+        text = sb.get(path, max_bytes=_EDIT, timeout=_t(sb, 120)).decode()
+        n = text.count(old)
+        if n != 1:
+            return f"old text not found in {path}" if n == 0 else f"old text appears {n} times in {path}: add the lines around it"
+        sb.put(path, text.replace(old, new).encode(), timeout=_t(sb, 120))
+    except SandboxGone as e:
+        return _gone(e)
+    except RuntimeError as e:
+        return f"cannot edit {path}: {e}"
+    except UnicodeDecodeError:  # first: it is a ValueError
+        return f"{path} is not UTF-8 text"
+    except ValueError:
+        return f"{path} is bigger than {_EDIT} bytes: edit it with run()"
+    return f"edited {path}"
+
+
+def _py(arg):  # the in-sandbox session script (_pysession.py) as a shell command; its output stays under _MAX bytes
+    return (f"command -v python3 >/dev/null || {{ echo 'python3 is not in this sandbox image: ask the user to set "
+            f"AGVISOR_IMAGE (python:3.12-slim has it)'; exit 127; }}; S={shlex.quote(_PYSESSION)}; export S; "
+            f"python3 -c \"$S\" {arg} 2>&1 | tail -c {_MAX}")
+
+
+def python(code: str, timeout: int = 60, restart: bool = False) -> str:
+    """Run Python in the sandbox in a session that keeps variables, imports and functions between calls, like notebook
+    cells: load data once, then explore it with small calls. The value of the last expression is printed. Output is
+    stdout and stderr merged (the last ~30 KB). At `timeout` seconds the call raises TimeoutError and the session
+    survives; `restart=True` starts a fresh session first. The session is lost when the sandbox is reset or
+    deleted. Needs python3 in the sandbox image."""
+    try:
+        sb = _get()
+        if restart:
+            sb.exec(_py("kill"), timeout=_t(sb, 30))
+        wait = _t(sb, timeout + 5)  # the alarm in the session fires 5 s before exec() gives up
+        r = sb.exec(_py(max(1, wait - 5)), input=code, timeout=wait)
+        if r.returncode == 124:  # the code is stuck where the alarm can't reach it (a C call): only a restart frees us
+            sb.exec(_py("kill"), timeout=_t(sb, 30))
+            return f"timed out after {timeout} s and the python session was killed: its variables are gone"
+    except SandboxGone as e:
+        return _gone(e)
+    return (r.stdout or "(no output)") + (f"\n[exit {r.returncode}]" if r.returncode else "")
 
 
 def list_files(path: str = ".") -> str:
@@ -175,6 +228,8 @@ def main():
     app.tool()(run)
     app.tool()(write_file)
     app.tool()(read_file)
+    app.tool()(edit_file)
+    app.tool()(python)
     app.tool()(list_files)
     app.tool()(start_job)
     app.tool()(job_output)

@@ -4,6 +4,7 @@ import io
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -1032,6 +1033,96 @@ def test_mcp_write_file():
     m._sb = None
 
 
+def test_mcp_edit_file():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        idle_ttl = 60
+
+        def __init__(self):
+            self.files, self.stopped = {"/a": "x = 1\ny = 1\ncafé = 1\n".encode(), "/bin": b"\xff\xfe", "/big": b"x" * 1_000_001}, False
+
+        def get(self, path, *, max_bytes, timeout):
+            if path not in self.files:
+                raise RuntimeError(f"get {path!r} failed (exit 1): not a file: {path}")
+            if len(self.files[path]) > max_bytes:
+                raise ValueError("too big")
+            return self.files[path]
+
+        def put(self, path, data, *, timeout):
+            self.files[path] = data
+
+    box = Fake()
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+        assert m.edit_file("/a", "y = 1", "y = 2") == "edited /a" and box.files["/a"] == "x = 1\ny = 2\ncafé = 1\n".encode()
+        assert m.edit_file("/a", "= 1", "= 3").startswith("old text appears 2 times") and b"y = 2" in box.files["/a"]  # untouched
+        assert m.edit_file("/a", "nope", "x") == "old text not found in /a"
+        assert m.edit_file("/a", "café", "tea") == "edited /a" and box.files["/a"].endswith(b"tea = 1\n")
+        assert m.edit_file("/a", "", "x").startswith("old must not be empty")
+        assert "not UTF-8" in m.edit_file("/bin", "a", "b") and box.files["/bin"] == b"\xff\xfe"
+        assert "bigger than" in m.edit_file("/big", "a", "b") and "cannot edit /nope" in m.edit_file("/nope", "a", "b")
+    m._sb = None
+
+
+def test_mcp_python():
+    import sys
+    import tempfile
+
+    from agvisor import mcp_server as m
+
+    d = tempfile.mkdtemp(dir="/tmp")  # short: a unix socket path is limited to ~100 characters
+    env = {**os.environ, "AGVISOR_PYDIR": f"{d}/py", "PATH": f"{os.path.dirname(sys.executable)}:{os.environ['PATH']}"}
+
+    class Fake:  # runs the real command locally with sh, as exec() would inside the sandbox
+        idle_ttl = 600
+
+        def exec(self, cmd, *, input=None, timeout):
+            try:
+                return subprocess.run(["sh", "-c", cmd], input=input, capture_output=True, text=True, env=env, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess([], 124, "", "")
+
+    box = Fake()
+    m._sb = None
+    try:
+        with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+            out = m.python("x = 41\nprint('hi')\nimport sys; print('err', file=sys.stderr)")
+            assert out.startswith("[new python session") and out.endswith("hi\nerr\n"), out
+            assert m.python("x + 1") == "42\n"  # same interpreter: no new-session notice, the last expression is printed
+            assert m.python("def f(n): return n * 2\n") == "(no output)" and m.python("f(x)") == "82\n"
+            out = m.python("1 / 0")
+            assert "ZeroDivisionError" in out and 'File "<python>"' in out and "_pysession" not in out, out
+            assert "SyntaxError" in m.python("def f(:") and m.python("x") == "41\n"  # an error doesn't end the session
+            assert "SystemExit" in m.python("raise SystemExit(3)") and m.python("x") == "41\n"
+            out = m.python("while True: pass", timeout=1)  # the alarm interrupts it, the variables stay
+            assert "TimeoutError: timed out after 1 s" in out and m.python("x") == "41\n", out
+            out = m.python("print('a' * 100_000)")  # bounded: the tail is all the agent gets
+            assert len(out) <= m._MAX + 1, len(out)
+            assert m.python("x", restart=True).startswith("[new python session") and "NameError" in m.python("y")
+            # C code that never returns to the interpreter, here the alarm ignored: exec() gives up and the session is killed
+            out = m.python("import signal; signal.signal(signal.SIGALRM, signal.SIG_IGN)\nwhile True: pass", timeout=1)
+            assert out.startswith("timed out after 1 s and the python session was killed"), out
+            assert m.python("1").startswith("[new python session")
+            box.exec(m._py("kill"), timeout=30)
+            assert not os.path.exists(f"{d}/py/sock")
+    finally:
+        subprocess.run(["sh", "-c", m._py("kill")], env=env, capture_output=True)
+        shutil.rmtree(d, ignore_errors=True)
+        m._sb = None
+
+    # no python3 in the image: say so, with the exit code
+    class NoPython:
+        idle_ttl = 600
+
+        def exec(self, cmd, *, input=None, timeout):
+            return subprocess.run(["/bin/sh", "-c", cmd], input=input, capture_output=True, text=True, env={"PATH": "/nonexistent"}, timeout=timeout)
+
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: NoPython()):
+        assert "python3 is not in this sandbox image" in m.python("1") and m.python("1").endswith("[exit 127]")
+    m._sb = None
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -1073,6 +1164,8 @@ if __name__ == "__main__":
     test_cli()
     test_mcp_server()
     test_mcp_write_file()
+    test_mcp_edit_file()
+    test_mcp_python()
     test_mcp_jobs()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
