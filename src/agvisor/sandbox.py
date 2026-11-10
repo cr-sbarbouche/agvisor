@@ -1,14 +1,20 @@
 import base64
 import codecs
 import collections
+import io
+import math
 import os
 import re
 import secrets
 import shlex
 import subprocess
+import tarfile
+import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
+from . import egress_proxy
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
@@ -30,6 +36,12 @@ wait_for systemctl --user is-active --quiet $S
 systemctl --user restart $S
 wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 """
+_PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
+# spawn(): a job lives in _JOBS/<id>/{log,pid,rc}. The rootfs, so `disk` caps what a job logs (/tmp is RAM under gVisor).
+# _JOB runs as `sh -c _JOB DIR COMMAND TIMEOUT` (0 = none): GNU timeout starts a process group of its own whose id is its
+# pid, so `kill -- -PID` reaches the command and whatever it started; it also writes the exit code when it ends.
+_JOBS = "/var/tmp/.agvisor-jobs"
+_JOB = 'timeout -k 5 "$2" sh -c "$1" >"$0/log" 2>&1 </dev/null & echo $! >"$0/pid"; wait $!; echo $? >"$0/rc"'
 _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
 
 
@@ -39,11 +51,78 @@ class SandboxGone(RuntimeError):
     the same volume."""
 
 
+class Job:
+    """A command running in the background of a sandbox, from Sandbox.spawn(). It outlives your process, and ends when
+    it finishes, is kill()ed, or the sandbox goes (idle_ttl and lifetime too: poll(), read() and wait() count as
+    activity for idle_ttl, the job itself does not). `Job(sandbox, id)` picks one up again later."""
+
+    def __init__(self, sandbox, id):
+        if not re.fullmatch(r"[0-9a-f]{12}", id):
+            raise ValueError(f"invalid job id {id!r}")
+        self.sandbox, self.id, self.returncode = sandbox, id, None
+        self._d = f"{_JOBS}/{id}"
+
+    def _check(self, wait=0):
+        """One exec: wait up to `wait` seconds for the job to end. Its exit code, or None while it runs."""
+        d = self._d
+        r = self.sandbox.exec(f"[ -d {d} ] || exit 2; for i in $(seq {wait}); do [ -e {d}/rc ] && break; sleep 1; done; "
+                              f"cat {d}/rc 2>/dev/null; true", timeout=wait + 5)
+        if r.returncode == 2:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}")
+        if r.returncode:
+            raise RuntimeError(f"checking job {self.id} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+        if r.stdout.strip():
+            self.returncode = int(r.stdout)
+        return self.returncode
+
+    def poll(self):
+        """The exit code, or None while it still runs. 143 = killed with TERM, 137 = KILL, 124 = hit its timeout."""
+        return self.returncode if self.returncode is not None else self._check()
+
+    def wait(self, timeout=None):
+        """Block until it ends and return the exit code; TimeoutError after `timeout` seconds (it keeps running).
+        One exec() per ~25 s: cheap over ssh."""
+        end = None if timeout is None else time.monotonic() + timeout
+        ttl = self.sandbox.idle_ttl
+        cap = min(25, ttl - 12) if ttl else 25  # exec(timeout=wait+5) must stay under idle_ttl - 6
+        if cap < 1:
+            raise ValueError(f"idle_ttl={ttl}s is too short to wait() in")
+        while self.returncode is None:
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                raise TimeoutError(f"job {self.id} is still running")
+            self._check(cap if left is None else max(1, min(cap, math.ceil(left))))
+        return self.returncode
+
+    def read(self, offset=0, max_bytes=100_000):
+        """Its output (stdout and stderr merged) from byte `offset` on, at most `max_bytes`, as bytes. The next read
+        starts at offset + len(result); empty = nothing new yet. A job's log lives in the sandbox's disk, uncapped
+        apart from `Limits.disk`."""
+        d = self._d
+        try:
+            data = self.sandbox._b64(f"[ -f {d}/log ] || {{ echo 'no such job' >&2; exit 2; }}; "
+                                     f"tail -c +{int(offset) + 1} {d}/log | head -c {int(max_bytes)} | base64 -w0",
+                                     int(max_bytes), self.sandbox._short())
+        except RuntimeError as e:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}: {e}") from None
+        if data is None:
+            raise RuntimeError("the sandbox sent more output than asked for")
+        return data
+
+    def kill(self, force=False):
+        """Stop it and what it started (TERM; `force` = KILL). Not an error if it already ended: wait() gives the code."""
+        d = self._d
+        r = self.sandbox.exec(f"[ -d {d} ] || exit 2; kill -s {'KILL' if force else 'TERM'} -- -$(cat {d}/pid) 2>/dev/null; true",
+                              timeout=self.sandbox._short())
+        if r.returncode == 2:
+            raise LookupError(f"no job {self.id} in {self.sandbox.name}")
+
+
 class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc"):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -61,6 +140,14 @@ class Sandbox:
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
         if owner is not None and not re.fullmatch(_ID, owner):
             raise ValueError(f"invalid owner {owner!r}: letters, digits, '_', '.', '-' only (max 63)")
+        if egress is not None:
+            if gui or network != "bridge":
+                raise ValueError("egress= makes its own private network: headless only, and don't pass network=")
+            egress = list(egress)
+            if not egress:
+                raise ValueError("egress is empty: that is network='none'")
+            egress_proxy.parse_rules(egress)  # raises ValueError on an entry it can't use
+        self.egress, self._has_egress = egress, egress is not None  # _has_egress: also true for handles from list_sandboxes()
         self.owner = owner
         self.created = None  # a datetime, set by list_sandboxes(); handles from create_sandbox() don't know it
         self.persistent = name is not None
@@ -95,7 +182,7 @@ class Sandbox:
         l = self.limits
         a = ["run", "-d", f"--runtime={self.runtime}", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
-             f"--pids-limit={l.pids}", f"--network={self.network}",
+             f"--pids-limit={l.pids}", f"--network={self._net if self.egress else self.network}",
              # gVisor caps the rootfs overlay (a file on the host disk): writes past it get ENOSPC. Per-container,
              # no daemon setting needed. `root:` only: `all:` would also overlay /workspace and stop it persisting.
              f"--annotation=dev.gvisor.flag.overlay2=root:self,size={l.disk}"]
@@ -106,6 +193,8 @@ class Sandbox:
             a.append(f"--label=agvisor.owner={self.owner}")
         if self.persistent:
             a.append(f"--label=agvisor.name={self.name.removeprefix('agvisor-')}")
+        if self.egress:
+            a += ["--label=agvisor.egress=1", "--env-file=/dev/stdin"]  # the proxy password rides on stdin, not on a command line
         if self.data_dir:  # a docker volume is a host directory: it is outside gVisor's discarded rootfs overlay
             a.append(f"--volume={self.name}:{self.data_dir}")
             if not self.gui:
@@ -148,6 +237,41 @@ class Sandbox:
         if have != (self.owner or ""):
             raise PermissionError(f"sandbox {self.name!r} belongs to another owner")
 
+    @property
+    def _net(self):  # '_' after 'agvisor': no sandbox container is called like this, whatever `name=` is
+        return f"agvisor_net_{self.name.removeprefix('agvisor-')}"
+
+    @property
+    def _proxy(self):
+        return f"agvisor_proxy_{self.name.removeprefix('agvisor-')}"
+
+    def _egress_up(self):
+        """egress=: a private network with no route out, and on it a proxy that only lets the allowlist through. The
+        proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file."""
+        if self.persistent:  # leftovers of an earlier session of this name (an expired sandbox can't clean up after itself)
+            self._docker("rm", "-f", self._proxy, check=False)
+            self._docker("network", "rm", self._net, check=False)
+        # other expired sandboxes' networks, or docker runs out of address pools. `until`: not one being set up right now
+        self._docker("network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s", check=False)
+        token = secrets.token_urlsafe(18)  # the proxy password: any other container on the bridge can reach its port
+        env = "\n".join(f"{k}={v}" for k, v in [("AGVISOR_ALLOW", ",".join(self.egress)), ("AGVISOR_TOKEN", token),
+                                                 ("AGVISOR_WATCH", self.name)]) + "\n"
+        # --rm + AGVISOR_WATCH: the proxy ends by itself once the sandbox is gone, even if we are not around to stop() it
+        self._docker("run", "-d", "--rm", f"--runtime={self.runtime}", f"--name={self._proxy}", "--env-file=/dev/stdin",
+                     "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=512", "--cap-drop=ALL",
+                     "--security-opt=no-new-privileges", "--read-only", f"--label=agvisor.egress={self.name}",
+                     _PROXY_IMAGE, "python", "-u", "-c", Path(egress_proxy.__file__).read_text(), input=env)
+        self._docker("network", "create", "--internal", "--label=agvisor.egress=1", self._net)
+        self._docker("network", "connect", "--alias=proxy", self._net, self._proxy)
+        url = f"http://agvisor:{token}@proxy:{egress_proxy.PORT}"
+        skip = "localhost,127.0.0.1,::1"
+        return "".join(f"{k}={v}\n" for k, v in [("HTTP_PROXY", url), ("HTTPS_PROXY", url), ("http_proxy", url),
+                                                 ("https_proxy", url), ("NO_PROXY", skip), ("no_proxy", skip)])
+
+    def _egress_down(self):
+        self._docker("rm", "-f", self._proxy, check=False)
+        self._docker("network", "rm", self._net, check=False)
+
     def start(self):
         if self._running:  # create_sandbox() already started it, then `with` calls start() again
             return self
@@ -157,7 +281,13 @@ class Sandbox:
         if not resumed:
             if self.persistent:  # a stopped leftover would block the name; its data lives in the volume
                 self._docker("rm", "-f", self.name, check=False)
-            self._docker(*self.run_args())
+            try:
+                env = self._egress_up() if self.egress else None
+                self._docker(*self.run_args(), input=env)
+            except BaseException:
+                if self.egress:
+                    self._egress_down()
+                raise
         self._running = True  # the container exists from here, so stop() must clean up if setup fails
         try:
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
@@ -207,6 +337,24 @@ class Sandbox:
             raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
         return r
 
+    def _short(self):  # an exec() that only looks at files: well under idle_ttl, whatever it is
+        return min(30, self.idle_ttl - 7) if self.idle_ttl else 30
+
+    def spawn(self, cmd, *, timeout=None):
+        """Start `sh -c cmd` in the background and return a Job at once, for what outlives a single exec(): a long scan, a
+        dev server. `timeout` kills it after that many seconds; the default is to run until it ends, is kill()ed or the
+        sandbox goes. exec(timeout=) must stay under idle_ttl, a background job doesn't have to, but nothing keeps the
+        sandbox alive for it either: poll() it, or set `lifetime` for a hard budget. Same image requirements as exec()."""
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0 seconds")
+        job = Job(self, uuid.uuid4().hex[:12])
+        d = shlex.quote(job._d)
+        r = self.exec(f"mkdir -p {d} && {{ sh -c {shlex.quote(_JOB)} {d} {shlex.quote(cmd)} {int(timeout or 0)} >/dev/null 2>&1 </dev/null & }}; "
+                      f"for i in $(seq 50); do [ -s {d}/pid ] && exit 0; sleep 0.1; done; exit 1", timeout=self._short())
+        if r.returncode:
+            raise RuntimeError(f"spawn failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+        return job
+
     def put(self, path, data: bytes, *, timeout=120):
         """Write `data` to `path` inside: parent directories are created, an existing file is replaced. Goes through
         exec() (base64 on stdin: any bytes survive, a dead sandbox raises SandboxGone). Relative paths start in
@@ -216,9 +364,48 @@ class Sandbox:
         if r.returncode:
             raise RuntimeError(f"put {path!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
 
-    def get(self, path, *, max_bytes=10_000_000, timeout=120):
-        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
-        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+    def put_dir(self, local, remote, *, timeout=120):
+        """Copy the local directory `local` into `remote` inside: created if needed, files of the same name replaced,
+        others kept. A tar through put(), so the same limits (GNU tar and coreutils in the image). Links are copied as
+        links, never followed: a link on your side can't pull a host file into the sandbox. Owners are reset."""
+        if not os.path.isdir(local):
+            raise NotADirectoryError(local)
+
+        def clean(ti):  # your uid and user name are none of the sandbox's business
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = ""
+            return ti
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as t:
+            t.add(local, arcname=".", filter=clean)
+        tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
+        self.put(tmp, buf.getvalue(), timeout=timeout)
+        r = self.exec(f"mkdir -p -- {q} && tar -xf {tmp} -C {q} --no-same-owner; rc=$?; rm -f {tmp}; exit $rc", timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"put_dir {remote!r} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def get_dir(self, remote, local, *, max_bytes=50_000_000, timeout=120):
+        """Copy the directory `remote` inside to `local` here: created if needed, files of the same name replaced. The
+        sandbox is untrusted, so the tar that comes out is capped at `max_bytes` (ValueError) and extracted with
+        tarfile's "data" filter: nothing lands outside `local`, no device files, no links that point out of it,
+        no setuid bits (tarfile.FilterError otherwise)."""
+        tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
+        r = self.exec(f"[ -d {q} ] || {{ echo 'not a directory' >&2; exit 1; }}; tar -cf {tmp} -C {q} .", timeout=timeout)
+        if r.returncode:
+            raise RuntimeError(f"get_dir {remote!r} failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+        try:
+            data = self.get(tmp, max_bytes=max_bytes, timeout=timeout)
+        finally:
+            self.exec(f"rm -f {tmp}", timeout=timeout)
+        os.makedirs(local, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            t.extractall(local, filter="data")
+
+    def _b64(self, script, max_bytes, timeout):
+        """Run `script`, which prints base64, and decode it; None if it is more than max_bytes. It is the sandbox talking:
+        a doctored `base64` can't fill our memory. A failing script raises RuntimeError with what it printed (stderr is
+        merged into the same stream)."""
         out, size = [], 0
         limit = 4 * (max_bytes // 3 + 2)  # base64 characters of max_bytes+1 bytes; a sandbox that sends more is lying
 
@@ -228,13 +415,22 @@ class Sandbox:
             if size <= limit:
                 out.append(text)
 
-        q = shlex.quote(path)
-        r = self.exec(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
-                      timeout=timeout, on_output=keep)  # on_output: bounded memory, stderr merged into the same stream
+        r = self.exec(script, timeout=timeout, on_output=keep)  # on_output: bounded memory
         if r.returncode:
-            raise RuntimeError(f"get {path!r} failed (exit {r.returncode}): {r.stdout.strip()[-300:]}")
+            raise RuntimeError(f"exit {r.returncode}: {r.stdout.strip()[-300:]}")
         data = None if size > limit else base64.b64decode("".join(out), validate=True)
-        if data is None or len(data) > max_bytes:
+        return data if data is not None and len(data) <= max_bytes else None
+
+    def get(self, path, *, max_bytes=10_000_000, timeout=120):
+        """Contents of the regular file at `path` inside, as bytes. A bigger file raises ValueError: the sandbox is
+        untrusted, so what we read from it is capped (it can't fill our memory, even with a doctored `base64`)."""
+        q = shlex.quote(path)
+        try:
+            data = self._b64(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
+                             max_bytes, timeout)
+        except RuntimeError as e:
+            raise RuntimeError(f"get {path!r} failed ({e})") from None
+        if data is None:
             raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
         return data
 
@@ -248,6 +444,8 @@ class Sandbox:
     def stop(self):
         """Remove the container and free its CPU/RAM. A named sandbox keeps its data volume."""
         self._docker("rm", "-f", self.name, check=False)
+        if self._has_egress:
+            self._egress_down()
         self._running = False
 
     def delete(self):
@@ -321,17 +519,18 @@ def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sa
     Each has `.created` (when its container was made) and `.owner`. `owner=` lists only that owner's.
     Anonymous ones (leaked by a crashed process) are included, so this is also how you find and kill them.
     Don't start() a stopped handle: that makes a fresh default-image container."""
-    fmt = "\t".join(["{{.Names}}", "{{.State}}", '{{.Label "agvisor.name"}}', '{{.Label "agvisor.owner"}}', "{{.CreatedAt}}"])
+    fmt = "\t".join(["{{.Names}}", "{{.State}}", '{{.Label "agvisor.name"}}', '{{.Label "agvisor.owner"}}', "{{.CreatedAt}}",
+                     '{{.Label "agvisor.egress"}}'])
     out = Sandbox(host=host)._docker("ps", "-a", "--filter", "label=agvisor",
                                      *(["--filter", f"label=agvisor.owner={owner}"] if owner else []),
                                      "--format", fmt).stdout
     boxes = []
     for line in out.splitlines():
-        cname, state, label, own, created = line.split("\t")  # tabs: CreatedAt has spaces, a label can be empty
+        cname, state, label, own, created, egress = line.split("\t")  # tabs: CreatedAt has spaces, a label can be empty
         sb = Sandbox(name=label or None, owner=own or None, host=host)
         if not label:
             sb.name = cname  # anonymous: its random container name is all there is
-        sb._running = state == "running"
+        sb._running, sb._has_egress = state == "running", bool(egress)  # a proxy and a network to remove too
         sb.created = datetime.strptime(created.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")  # "... +0000 UTC": drop the zone name
         boxes.append(sb)
     return boxes
@@ -349,6 +548,7 @@ def create_sandbox(
     owner: str | None = None,
     host: str | None = None,
     runtime: str = "runsc",
+    egress: list[str] | None = None,
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
@@ -373,6 +573,12 @@ def create_sandbox(
     network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
               docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from
               reaching a gui sandbox there: use a network of its own.
+    egress   Outbound allowlist, e.g. ["pypi.org", "files.pythonhosted.org", "10.0.0.0/24:8080"]. The sandbox gets a
+              private network with no route out, and its only way out is an HTTP(S) proxy (HTTP(S)_PROXY is set) that
+              lets those hosts through: `host` or `*.host` (ports 80 and 443 unless `host:port` or `host:*`), an IPv4
+              address or a network. A name must resolve to public addresses; reaching a private one takes an IP entry.
+              Needs an image with python 3.12+ on the docker host (python:3.12-slim) for the proxy. Don't pass
+              network=. Headless only; fixed at creation, like limits.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
@@ -386,4 +592,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, owner=owner, host=host, runtime=runtime).start()
+                   name=name, owner=owner, host=host, runtime=runtime, egress=egress).start()

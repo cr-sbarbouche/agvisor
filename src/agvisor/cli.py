@@ -1,5 +1,8 @@
-"""agvisor ls | rm | exec: look at, clean up and poke the sandboxes on a docker host."""
+"""agvisor ls | rm | exec | put | get: look at, clean up, poke and feed the sandboxes on a docker host."""
 import argparse
+import shlex
+import tarfile
+from pathlib import Path
 from datetime import datetime, timezone
 
 from .sandbox import SandboxGone, list_sandboxes
@@ -20,6 +23,15 @@ def main(argv=None):
     ex.add_argument("name")
     ex.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`")
     ex.add_argument("--timeout", type=int, default=120)
+    put = sub.add_parser("put", parents=[common], help="copy a local file or directory into a running sandbox")
+    put.add_argument("name")
+    put.add_argument("local")
+    put.add_argument("remote", help="the file's new path (or the directory to copy into) inside")
+    get = sub.add_parser("get", parents=[common], help="copy a file or directory out of a running sandbox")
+    get.add_argument("name")
+    get.add_argument("remote")
+    get.add_argument("local", help="a file or a directory here (replaced / merged into)")
+    get.add_argument("--max-bytes", type=int, help="refuse more than this (default 10 MB for a file, 50 MB for a directory)")
     a = p.parse_args(argv)
 
     boxes = list_sandboxes(a.host, owner=a.owner)
@@ -42,7 +54,21 @@ def main(argv=None):
     sb = next(sb for sb in boxes if sb.name == a.name)
     if not sb._running:
         p.error(f"{sb.name} is not running")
-    try:  # ponytail: a handle from list_sandboxes() doesn't know idle_ttl, so this isn't counted as activity
-        return sb.exec(" ".join(a.command), timeout=a.timeout, on_output=lambda t: print(t, end="", flush=True)).returncode
-    except SandboxGone as e:
+    kw = {"max_bytes": a.max_bytes} if a.cmd == "get" and a.max_bytes else {}
+    try:  # ponytail: a handle from list_sandboxes() doesn't know idle_ttl, so none of these count as activity
+        if a.cmd == "put":
+            if Path(a.local).is_dir():
+                sb.put_dir(a.local, a.remote)
+            else:
+                sb.put(a.remote, Path(a.local).read_bytes())
+        elif a.cmd == "get":
+            if sb.exec(f"[ -d {shlex.quote(a.remote)} ]").returncode == 0:
+                sb.get_dir(a.remote, a.local, **kw)
+            else:
+                Path(a.local).write_bytes(sb.get(a.remote, **kw))
+        else:
+            return sb.exec(" ".join(a.command), timeout=a.timeout, on_output=lambda t: print(t, end="", flush=True)).returncode
+    except (SandboxGone, RuntimeError, ValueError, OSError, tarfile.TarError) as e:  # OSError: a local path
         p.error(str(e))
+    print("done")
+    return 0
