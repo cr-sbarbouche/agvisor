@@ -1,6 +1,7 @@
 """agvisor ls | rm | exec | put | get: look at, clean up, poke and feed the sandboxes on a docker host."""
 import argparse
 import shlex
+import sys
 import tarfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -63,7 +64,9 @@ def main(argv=None):
                 sb.put(a.remote, Path(a.local).read_bytes())
         elif a.cmd == "get":
             if sb.exec(f"[ -d {shlex.quote(a.remote)} ]").returncode == 0:
-                sb.get_dir(a.remote, a.local, **kw)
+                skipped = sb.get_dir(a.remote, a.local, **kw)
+                if skipped:
+                    print(f"left out {len(skipped)} link(s) that point outside: {', '.join(skipped[:5])}", file=sys.stderr)
             else:
                 Path(a.local).write_bytes(sb.get(a.remote, **kw))
         else:

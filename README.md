@@ -149,7 +149,7 @@ sb.put_dir("./project", "/workspace/project")   # a whole directory in: created,
 sb.get_dir("/workspace/out", "./results")       # and out (max_bytes=50 MB of tar)
 ```
 
-They are a tar through `put()`/`get()` (GNU tar in the image). `put_dir` copies links as links and never follows them, so a link on your side can't pull a host file into the sandbox, and resets owners. `get_dir` extracts what an untrusted sandbox sends with tarfile's `data` filter: nothing lands outside the destination, no device files, no links that point out, no setuid bits (`tarfile.FilterError` otherwise). From a shell: `agvisor put NAME ./file-or-dir /remote/path` and `agvisor get NAME /remote/path ./local`.
+They are a tar through `put()`/`get()` (GNU tar in the image). `put_dir` copies links as links and never follows them, so a link on your side can't pull a host file into the sandbox, and resets owners. `get_dir` extracts what an untrusted sandbox sends with tarfile's `data` filter: nothing lands outside the destination, no device files, no setuid bits (`tarfile.FilterError` otherwise). Links that point outside the destination, every absolute one (a venv's `python`), are left out rather than followed or made an error: `get_dir` returns their names. From a shell: `agvisor put NAME ./file-or-dir /remote/path` and `agvisor get NAME /remote/path ./local`.
 
 ### Background jobs
 

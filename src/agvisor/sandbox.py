@@ -388,8 +388,9 @@ class Sandbox:
     def get_dir(self, remote, local, *, max_bytes=50_000_000, timeout=120):
         """Copy the directory `remote` inside to `local` here: created if needed, files of the same name replaced. The
         sandbox is untrusted, so the tar that comes out is capped at `max_bytes` (ValueError) and extracted with
-        tarfile's "data" filter: nothing lands outside `local`, no device files, no links that point out of it,
-        no setuid bits (tarfile.FilterError otherwise)."""
+        tarfile's "data" filter: nothing lands outside `local`, no device files, no setuid bits (tarfile.FilterError
+        otherwise). Links that point outside `local` (every absolute one, e.g. a venv's python) are left out, not
+        followed or an error: returns their names."""
         tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
         r = self.exec(f"[ -d {q} ] || {{ echo 'not a directory' >&2; exit 1; }}; tar -cf {tmp} -C {q} .", timeout=timeout)
         if r.returncode:
@@ -399,8 +400,16 @@ class Sandbox:
         finally:
             self.exec(f"rm -f {tmp}", timeout=timeout)
         os.makedirs(local, exist_ok=True)
+        skipped = []
+
+        def keep(member, dest):
+            try:
+                return tarfile.data_filter(member, dest)
+            except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
+                skipped.append(member.name)  # None = don't extract it
         with tarfile.open(fileobj=io.BytesIO(data)) as t:
-            t.extractall(local, filter="data")
+            t.extractall(local, filter=keep)
+        return skipped
 
     def _b64(self, script, max_bytes, timeout):
         """Run `script`, which prints base64, and decode it; None if it is more than max_bytes. It is the sandbox talking:

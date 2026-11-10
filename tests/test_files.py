@@ -60,9 +60,9 @@ with create_sandbox(os.environ.get("AGVISOR_IMAGE"), host=os.environ.get("AGVISO
         out = Path(d, "back")
         out.mkdir()
         (out / "keep").write_text("keep")  # merged into, not wiped
-        sb.get_dir("/tmp/new dir/proj", out)
+        assert sb.get_dir("/tmp/new dir/proj", out) == ["./link"]  # an absolute link points out of `out`: left out, and said so
         assert (out / "a.txt").read_text() == "a" and (out / "sub dir" / "b'.bin").read_bytes() == blob
-        assert (out / "extra").read_text() == "extra\n" and (out / "keep").read_text() == "keep" and (out / "link").is_symlink()
+        assert (out / "extra").read_text() == "extra\n" and (out / "keep").read_text() == "keep" and not (out / "link").exists()
         assert sb.exec("ls /var/tmp | grep -c '^.agvisor-.*tar$'").stdout.strip() == "0"  # no tarballs left behind
         try:
             sb.get_dir("/tmp/new dir/proj", Path(d, "small"), max_bytes=1000)

@@ -769,17 +769,21 @@ def test_put_dir_and_get_dir():
         sb.get_dir("/work dir", str(dest))
         assert (dest / "ok.txt").read_bytes() == b"hi" and (dest / "sub" / "c").read_bytes() == b"c"
         assert execs[-2].startswith("[ -d '/work dir' ] ||") and execs[-2].endswith(" -C '/work dir' .") and execs[-1].startswith("rm -f ")
-        evil = {"parent": [("../escaped", "file", b"x")],
-                "link out": [("./l", "link", "../../etc"), ("./l/pwn", "file", b"x")], "link abs": [("./l", "link", "/etc")]}
-        for what, members in evil.items():
-            got = tar_of(*members)
-            try:
-                sb.get_dir("/x", str(Path(d, "safe")))
-            except tarfile.FilterError:
-                pass
-            else:
-                raise AssertionError(f"extracted a {what} member")
+        try:  # a regular file outside the destination is an attack: an error, nothing extracted
+            got = tar_of(("../escaped", "file", b"x"))
+            sb.get_dir("/x", str(Path(d, "safe")))
+        except tarfile.FilterError:
+            pass
+        else:
+            raise AssertionError("extracted a ../ member")
         assert not Path(d, "escaped").exists()
+        # links that point out are left out, and reported: absolute (a venv's python) or via ../
+        got = tar_of(("./l", "link", "../../etc"), ("./l/pwn", "file", b"x"), ("./abs", "link", "/etc"), ("./ok", "file", b"ok"),
+                     ("./inside", "link", "ok"))
+        skipped = sb.get_dir("/x", str(Path(d, "safe2")))
+        assert skipped == ["./l", "./abs"] and Path(d, "safe2", "ok").read_bytes() == b"ok"
+        assert (Path(d, "safe2") / "inside").is_symlink() and not (Path(d, "safe2") / "abs").exists()  # a link that stays inside is kept
+        assert Path(d, "safe2", "l", "pwn").read_bytes() == b"x" and not Path(d, "pwn").exists()  # `l` is a plain dir now: nothing left the destination
         got = tar_of(("/tmp/agvisor-escaped", "file", b"x"))  # an absolute name is made relative: it lands inside
         sb.get_dir("/x", str(Path(d, "safe")))
         assert Path(d, "safe", "tmp", "agvisor-escaped").read_bytes() == b"x" and not Path("/tmp/agvisor-escaped").exists()
