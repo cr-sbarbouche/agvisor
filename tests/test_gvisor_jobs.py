@@ -37,11 +37,12 @@ with create_sandbox(lifetime=600, **kw) as sb:
     t = sb.spawn("sleep 300", timeout=2)  # its own timeout
     assert t.wait(timeout=60) == 124
 
+    base = sleepers(sb)  # the sandbox's own PID 1 is `sleep <lifetime>`
     tree = sb.spawn("sleep 300 & sleep 300 & wait")  # kill() reaches what the command started, not just the shell
     time.sleep(1)
-    assert sleepers(sb) == 2 and tree.poll() is None
+    assert sleepers(sb) == base + 2 and tree.poll() is None
     tree.kill()
-    assert tree.wait(timeout=30) == 143 and sleepers(sb) == 0, sleepers(sb)
+    assert tree.wait(timeout=30) == 143 and sleepers(sb) == base, sleepers(sb)
     tree.kill()  # already over: not an error
 
     stubborn = sb.spawn("trap '' TERM; while true; do sleep 1; done")  # ignores TERM
@@ -54,7 +55,7 @@ with create_sandbox(lifetime=600, **kw) as sb:
     else:
         raise AssertionError("a job that ignores TERM ended")
     stubborn.kill(force=True)
-    assert stubborn.wait(timeout=30) == 137 and sleepers(sb) == 0
+    assert stubborn.wait(timeout=30) == 137 and sleepers(sb) == base
 
     for call in (Job(sb, "0123456789ab").poll, Job(sb, "0123456789ab").kill, lambda: Job(sb, "0123456789ab").read()):
         try:
@@ -67,7 +68,7 @@ with create_sandbox(lifetime=600, **kw) as sb:
 with create_sandbox(idle_ttl=30, **kw) as sb:
     job = sb.spawn("sleep 40")  # longer than idle_ttl
     assert job.wait(timeout=90) == 0  # wait() is an exec every ~18 s: the sandbox stayed alive for it
-    sb.exec("true")
+    sb.exec("true", timeout=5)  # still alive after 40 s with nothing but wait() in between
 with create_sandbox(idle_ttl=30, **kw) as sb:
     job = sb.spawn("sleep 300")
     time.sleep(45)  # nobody asks: the idle watchdog deletes the sandbox, job and all

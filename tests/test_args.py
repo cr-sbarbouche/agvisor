@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from agvisor import Job, Limits, Sandbox, SandboxGone
-from agvisor.sandbox import _RDP_SETUP, create_sandbox, list_sandboxes
+from agvisor.sandbox import _RDP_SETUP, create_sandbox, list_sandboxes, prune_egress
 
 
 def test_headless():
@@ -474,29 +474,34 @@ def test_egress_args():
     assert "--network=agvisor_net_proj" in a and "--env-file=/dev/stdin" in a and "--label=agvisor.egress=1" in a
     assert "--network=bridge" in Sandbox().run_args() and "--env-file=/dev/stdin" not in Sandbox().run_args()
 
-    calls = []
+    calls, ps_rows = [], ""
 
     def run(cmd, **kw):
         calls.append((cmd[1:], kw.get("input")))
-        return subprocess.CompletedProcess(cmd, 1 if "ubuntu:24.04" in cmd and fail else 0, "", "boom")
+        out = {"ps": ps_rows}.get(cmd[1], "")
+        if cmd[1] == "inspect" and cmd[-1].startswith("agvisor_proxy_"):
+            out = "172.18.0.2\n"  # the proxy's address on the private network
+        return subprocess.CompletedProcess(cmd, 1 if "ubuntu:24.04" in cmd and fail else 0, out, "boom")
 
     fail = False
     with mock.patch("agvisor.sandbox.subprocess.run", run):
         sb = create_sandbox(name="proj", egress=["pypi.org", "*.pythonhosted.org", "10.0.0.0/24:8080"])
         verbs = [c[0][:2] if c[0][0] in ("network", "volume") else c[0][:1] for c in calls]
-        # stale leftovers of the same name, orphans, then proxy -> network -> attach -> sandbox
-        assert verbs[3:] == [["rm"], ["rm"], ["network", "rm"], ["network", "prune"], ["run"], ["network", "create"],
-                             ["network", "connect"], ["run"]], verbs
-        proxy, create, connect, box = [c for c in calls if c[0][0] in ("run", "network") and c[0][1] not in ("rm", "prune")]
+        # orphans first, then leftovers of the same name, then proxy -> network -> attach -> its address -> sandbox
+        assert verbs[4:] == [["ps"], ["network", "prune"], ["rm"], ["network", "rm"], ["run"], ["network", "create"],
+                             ["network", "connect"], ["inspect"], ["run"]], verbs
+        proxy, create, connect, _, box = [c for c in calls if c[0][0] in ("run", "network", "inspect") and c[0][1] not in ("rm", "prune")][-5:]
         assert create[0] == ["network", "create", "--internal", "--label=agvisor.egress=1", "agvisor_net_proj"]
-        assert connect[0] == ["network", "connect", "--alias=proxy", "agvisor_net_proj", "agvisor_proxy_proj"]
+        assert connect[0] == ["network", "connect", "agvisor_net_proj", "agvisor_proxy_proj"]  # no DNS alias: gVisor has no 127.0.0.11
         penv = dict(l.split("=", 1) for l in proxy[1].split())
-        assert penv["AGVISOR_ALLOW"] == "pypi.org,*.pythonhosted.org,10.0.0.0/24:8080" and penv["AGVISOR_WATCH"] == "agvisor-proj"
+        assert penv["AGVISOR_ALLOW"] == "pypi.org,*.pythonhosted.org,10.0.0.0/24:8080"
         benv = dict(l.split("=", 1) for l in box[1].split())
-        assert benv["HTTPS_PROXY"] == benv["http_proxy"] == f"http://agvisor:{penv['AGVISOR_TOKEN']}@proxy:3128"
+        assert benv["HTTPS_PROXY"] == benv["http_proxy"] == f"http://agvisor:{penv['AGVISOR_TOKEN']}@172.18.0.2:3128"
         assert "localhost" in benv["NO_PROXY"]
         assert not any(penv["AGVISOR_TOKEN"] in str(c[0]) for c in calls)  # stdin only: a command line shows up in `ps`
-        assert "--runtime=runsc" in proxy[0] and "--network=agvisor_net_proj" in box[0] and "python:3.12-slim" in proxy[0]
+        assert "--runtime=runc" in proxy[0] and "--runtime=runsc" in box[0]  # gVisor has no embedded DNS: the proxy can't resolve names there
+        assert {"--user=65534:65534", "--cap-drop=ALL", "--read-only", "--security-opt=no-new-privileges"} <= set(proxy[0])
+        assert "--network=agvisor_net_proj" in box[0] and "python:3.12-slim" in proxy[0]
         assert "def parse_rules" in proxy[0][-1]  # the proxy runs the real source
         calls.clear()
         sb.stop()  # the sandbox first, then what it hangs on
@@ -505,8 +510,23 @@ def test_egress_args():
 
         calls.clear()  # an anonymous sandbox has no leftovers of its name to remove first
         create_sandbox(egress=["pypi.org"]).stop()
-        assert [c[0][:2] for c in calls] == [["network", "prune"], ["run", "-d"], ["network", "create"], ["network", "connect"],
-                                             ["run", "-d"], ["rm", "-f"], ["rm", "-f"], ["network", "rm"]]
+        assert [c[0][:2] for c in calls] == [["ps", "-a"], ["network", "prune"], ["run", "-d"], ["network", "create"],
+                                             ["network", "connect"], ["inspect", "-f"], ["run", "-d"], ["rm", "-f"], ["rm", "-f"],
+                                             ["network", "rm"]]
+
+        # orphans: a proxy whose sandbox expired (--rm) is removed once it is old enough, its network pruned after it
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+        old = "2026-01-01 00:00:00 +0000 UTC"
+        ps_rows = (f"agvisor_proxy_dead\tagvisor-dead\t{old}\n"  # its sandbox is gone
+                   f"agvisor_proxy_live\tagvisor-live\t{old}\nagvisor-live\t1\t{old}\n"  # still has one
+                   f"agvisor_proxy_new\tagvisor-new\t{now}\n")  # maybe its sandbox is just being pulled
+        calls.clear()
+        prune_egress()
+        assert [c[0] for c in calls] == [
+            ["ps", "-a", "--filter", "label=agvisor.egress", "--format", '{{.Names}}\t{{.Label "agvisor.egress"}}\t{{.CreatedAt}}'],
+            ["rm", "-f", "agvisor_proxy_dead"],
+            ["network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s"]], calls
+        ps_rows = ""
         fail = True  # the sandbox itself fails to start: the proxy and network must not be left behind
         calls.clear()
         try:
@@ -769,17 +789,21 @@ def test_put_dir_and_get_dir():
         sb.get_dir("/work dir", str(dest))
         assert (dest / "ok.txt").read_bytes() == b"hi" and (dest / "sub" / "c").read_bytes() == b"c"
         assert execs[-2].startswith("[ -d '/work dir' ] ||") and execs[-2].endswith(" -C '/work dir' .") and execs[-1].startswith("rm -f ")
-        evil = {"parent": [("../escaped", "file", b"x")],
-                "link out": [("./l", "link", "../../etc"), ("./l/pwn", "file", b"x")], "link abs": [("./l", "link", "/etc")]}
-        for what, members in evil.items():
-            got = tar_of(*members)
-            try:
-                sb.get_dir("/x", str(Path(d, "safe")))
-            except tarfile.FilterError:
-                pass
-            else:
-                raise AssertionError(f"extracted a {what} member")
+        try:  # a regular file outside the destination is an attack: an error, nothing extracted
+            got = tar_of(("../escaped", "file", b"x"))
+            sb.get_dir("/x", str(Path(d, "safe")))
+        except tarfile.FilterError:
+            pass
+        else:
+            raise AssertionError("extracted a ../ member")
         assert not Path(d, "escaped").exists()
+        # links that point out are left out, and reported: absolute (a venv's python) or via ../
+        got = tar_of(("./l", "link", "../../etc"), ("./l/pwn", "file", b"x"), ("./abs", "link", "/etc"), ("./ok", "file", b"ok"),
+                     ("./inside", "link", "ok"))
+        skipped = sb.get_dir("/x", str(Path(d, "safe2")))
+        assert skipped == ["./l", "./abs"] and Path(d, "safe2", "ok").read_bytes() == b"ok"
+        assert (Path(d, "safe2") / "inside").is_symlink() and not (Path(d, "safe2") / "abs").exists()  # a link that stays inside is kept
+        assert Path(d, "safe2", "l", "pwn").read_bytes() == b"x" and not Path(d, "pwn").exists()  # `l` is a plain dir now: nothing left the destination
         got = tar_of(("/tmp/agvisor-escaped", "file", b"x"))  # an absolute name is made relative: it lands inside
         sb.get_dir("/x", str(Path(d, "safe")))
         assert Path(d, "safe", "tmp", "agvisor-escaped").read_bytes() == b"x" and not Path("/tmp/agvisor-escaped").exists()
@@ -848,6 +872,11 @@ def test_cli():
         with mock.patch("agvisor.sandbox.subprocess.run", fake):
             assert main("exec", "agvisor-old", "echo", "hi") == (3, "hi\n")  # the command's exit code, output as it comes
             assert main("exec", "agvisor-new", "echo")[0] == 2  # stopped: nothing to run in
+
+    calls, fake = fake_docker()
+    with mock.patch("agvisor.sandbox.subprocess.run", fake):
+        assert main("prune")[0] == 0  # the proxies and networks of expired egress= sandboxes
+    assert [c[1] for c in calls] == ["ps", "network"]
 
     import tempfile
     seen = []

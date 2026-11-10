@@ -34,8 +34,8 @@ try:
 
     job = m.start_job("echo one; sleep 2; echo \"t'wo\"")
     out = until(job, "[exit 0")
-    assert out == "one\nt'wo\n\n[exit 0; next offset 10]", out
-    assert m.job_output(job, 4) == "t'wo\n\n[exit 0; next offset 10]"  # only what is new
+    assert out == "one\nt'wo\n\n[exit 0; next offset 9]", out
+    assert m.job_output(job, 4) == "t'wo\n\n[exit 0; next offset 9]"  # only what is new
     long = m.start_job("sleep 300")
     assert "[running; next offset 0]" in m.job_output(long)
     assert m.kill_job(long).startswith("sent TERM")

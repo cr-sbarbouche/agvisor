@@ -1,11 +1,12 @@
-"""agvisor ls | rm | exec | put | get: look at, clean up, poke and feed the sandboxes on a docker host."""
+"""agvisor ls | rm | prune | exec | put | get: look at, clean up, poke and feed the sandboxes on a docker host."""
 import argparse
 import shlex
+import sys
 import tarfile
 from pathlib import Path
 from datetime import datetime, timezone
 
-from .sandbox import SandboxGone, list_sandboxes
+from .sandbox import SandboxGone, list_sandboxes, prune_egress
 
 
 def main(argv=None):
@@ -19,6 +20,7 @@ def main(argv=None):
     rm.add_argument("names", nargs="*", help="as printed by `ls`")
     rm.add_argument("--older-than", type=int, metavar="SECONDS", help="only those created longer ago than this")
     rm.add_argument("--data", action="store_true", help="also erase the files and snapshots of named sandboxes")
+    sub.add_parser("prune", parents=[common], help="remove the proxies and networks that expired egress= sandboxes left behind")
     ex = sub.add_parser("exec", parents=[common], help="run a shell command in a running sandbox")
     ex.add_argument("name")
     ex.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`")
@@ -34,6 +36,9 @@ def main(argv=None):
     get.add_argument("--max-bytes", type=int, help="refuse more than this (default 10 MB for a file, 50 MB for a directory)")
     a = p.parse_args(argv)
 
+    if a.cmd == "prune":
+        prune_egress(a.host)
+        return 0
     boxes = list_sandboxes(a.host, owner=a.owner)
     if a.cmd == "ls":
         for sb in boxes:
@@ -63,7 +68,9 @@ def main(argv=None):
                 sb.put(a.remote, Path(a.local).read_bytes())
         elif a.cmd == "get":
             if sb.exec(f"[ -d {shlex.quote(a.remote)} ]").returncode == 0:
-                sb.get_dir(a.remote, a.local, **kw)
+                skipped = sb.get_dir(a.remote, a.local, **kw)
+                if skipped:
+                    print(f"left out {len(skipped)} link(s) that point outside: {', '.join(skipped[:5])}", file=sys.stderr)
             else:
                 Path(a.local).write_bytes(sb.get(a.remote, **kw))
         else:

@@ -11,7 +11,7 @@ import subprocess
 import tarfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import egress_proxy
@@ -37,6 +37,8 @@ systemctl --user restart $S
 wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 """
 _PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
+_PROXY_RUNTIME = "runc"  # not gVisor: there, docker's embedded DNS (127.0.0.11) doesn't work, and the proxy couldn't resolve names
+_GRACE = 600  # seconds a proxy may exist before it must have a sandbox: its sandbox's image may still be downloading
 # spawn(): a job lives in _JOBS/<id>/{log,pid,rc}. The rootfs, so `disk` caps what a job logs (/tmp is RAM under gVisor).
 # _JOB runs as `sh -c _JOB DIR COMMAND TIMEOUT` (0 = none): GNU timeout starts a process group of its own whose id is its
 # pid, so `kill -- -PID` reaches the command and whatever it started; it also writes the exit code when it ends.
@@ -247,26 +249,41 @@ class Sandbox:
 
     def _egress_up(self):
         """egress=: a private network with no route out, and on it a proxy that only lets the allowlist through. The
-        proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file."""
-        if self.persistent:  # leftovers of an earlier session of this name (an expired sandbox can't clean up after itself)
+        proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file.
+        The sandbox gets the proxy's IP: docker's embedded DNS (127.0.0.11) does not work under gVisor."""
+        self._gc_egress()
+        if self.persistent:  # leftovers of an earlier session of this name
             self._docker("rm", "-f", self._proxy, check=False)
             self._docker("network", "rm", self._net, check=False)
-        # other expired sandboxes' networks, or docker runs out of address pools. `until`: not one being set up right now
-        self._docker("network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s", check=False)
         token = secrets.token_urlsafe(18)  # the proxy password: any other container on the bridge can reach its port
-        env = "\n".join(f"{k}={v}" for k, v in [("AGVISOR_ALLOW", ",".join(self.egress)), ("AGVISOR_TOKEN", token),
-                                                 ("AGVISOR_WATCH", self.name)]) + "\n"
-        # --rm + AGVISOR_WATCH: the proxy ends by itself once the sandbox is gone, even if we are not around to stop() it
-        self._docker("run", "-d", "--rm", f"--runtime={self.runtime}", f"--name={self._proxy}", "--env-file=/dev/stdin",
-                     "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=512", "--cap-drop=ALL",
-                     "--security-opt=no-new-privileges", "--read-only", f"--label=agvisor.egress={self.name}",
+        env = "".join(f"{k}={v}\n" for k, v in [("AGVISOR_ALLOW", ",".join(self.egress)), ("AGVISOR_TOKEN", token)])
+        self._docker("run", "-d", f"--runtime={_PROXY_RUNTIME}", f"--name={self._proxy}", "--env-file=/dev/stdin",
+                     "--user=65534:65534", "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=512",
+                     "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+                     f"--label=agvisor.egress={self.name}",
                      _PROXY_IMAGE, "python", "-u", "-c", Path(egress_proxy.__file__).read_text(), input=env)
         self._docker("network", "create", "--internal", "--label=agvisor.egress=1", self._net)
-        self._docker("network", "connect", "--alias=proxy", self._net, self._proxy)
-        url = f"http://agvisor:{token}@proxy:{egress_proxy.PORT}"
+        self._docker("network", "connect", self._net, self._proxy)
+        ip = self._docker("inspect", "-f", f'{{{{(index .NetworkSettings.Networks "{self._net}").IPAddress}}}}', self._proxy).stdout.strip()
+        url = f"http://agvisor:{token}@{ip}:{egress_proxy.PORT}"
         skip = "localhost,127.0.0.1,::1"
         return "".join(f"{k}={v}\n" for k, v in [("HTTP_PROXY", url), ("HTTPS_PROXY", url), ("http_proxy", url),
                                                  ("https_proxy", url), ("NO_PROXY", skip), ("no_proxy", skip)])
+
+    def _gc_egress(self):
+        """A sandbox that expires by itself (--rm) can't remove its proxy and network. So any egress start, and
+        prune_egress(), remove the proxies that have no sandbox, then the networks nothing is attached to."""
+        rows = [r.split("\t") for r in self._docker(
+            "ps", "-a", "--filter", "label=agvisor.egress", "--format",
+            '{{.Names}}\t{{.Label "agvisor.egress"}}\t{{.CreatedAt}}').stdout.splitlines()]
+        boxes = {name for name, label, _ in rows if label == "1"}  # sandboxes carry "1", a proxy the name of its sandbox
+        now = datetime.now(timezone.utc)
+        dead = [name for name, label, created in rows
+                if label != "1" and label not in boxes and (now - _parse_created(created)).total_seconds() > _GRACE]
+        if dead:
+            self._docker("rm", "-f", *dead, check=False)
+        # `until`: not a network that another start is setting up right now
+        self._docker("network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s", check=False)
 
     def _egress_down(self):
         self._docker("rm", "-f", self._proxy, check=False)
@@ -388,8 +405,9 @@ class Sandbox:
     def get_dir(self, remote, local, *, max_bytes=50_000_000, timeout=120):
         """Copy the directory `remote` inside to `local` here: created if needed, files of the same name replaced. The
         sandbox is untrusted, so the tar that comes out is capped at `max_bytes` (ValueError) and extracted with
-        tarfile's "data" filter: nothing lands outside `local`, no device files, no links that point out of it,
-        no setuid bits (tarfile.FilterError otherwise)."""
+        tarfile's "data" filter: nothing lands outside `local`, no device files, no setuid bits (tarfile.FilterError
+        otherwise). Links that point outside `local` (every absolute one, e.g. a venv's python) are left out, not
+        followed or an error: returns their names."""
         tmp, q = f"/var/tmp/.agvisor-{uuid.uuid4().hex[:12]}.tar", shlex.quote(remote)
         r = self.exec(f"[ -d {q} ] || {{ echo 'not a directory' >&2; exit 1; }}; tar -cf {tmp} -C {q} .", timeout=timeout)
         if r.returncode:
@@ -399,8 +417,16 @@ class Sandbox:
         finally:
             self.exec(f"rm -f {tmp}", timeout=timeout)
         os.makedirs(local, exist_ok=True)
+        skipped = []
+
+        def keep(member, dest):
+            try:
+                return tarfile.data_filter(member, dest)
+            except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
+                skipped.append(member.name)  # None = don't extract it
         with tarfile.open(fileobj=io.BytesIO(data)) as t:
-            t.extractall(local, filter="data")
+            t.extractall(local, filter=keep)
+        return skipped
 
     def _b64(self, script, max_bytes, timeout):
         """Run `script`, which prints base64, and decode it; None if it is more than max_bytes. It is the sandbox talking:
@@ -417,7 +443,7 @@ class Sandbox:
 
         r = self.exec(script, timeout=timeout, on_output=keep)  # on_output: bounded memory
         if r.returncode:
-            raise RuntimeError(f"exit {r.returncode}: {r.stdout.strip()[-300:]}")
+            raise RuntimeError(f"(exit {r.returncode}): {r.stdout.strip()[-300:]}")
         data = None if size > limit else base64.b64decode("".join(out), validate=True)
         return data if data is not None and len(data) <= max_bytes else None
 
@@ -429,7 +455,7 @@ class Sandbox:
             data = self._b64(f"[ -f {q} ] || {{ printf 'not a file: %s\\n' {q} >&2; exit 1; }}; head -c {max_bytes + 1} -- {q} | base64 -w0",
                              max_bytes, timeout)
         except RuntimeError as e:
-            raise RuntimeError(f"get {path!r} failed ({e})") from None
+            raise RuntimeError(f"get {path!r} failed {e}") from None
         if data is None:
             raise ValueError(f"{path!r} is larger than max_bytes={max_bytes}")
         return data
@@ -514,6 +540,15 @@ class Sandbox:
         self.stop()
 
 
+def _parse_created(created):  # docker's "2026-11-06 09:28:33 +0000 UTC": drop the zone name
+    return datetime.strptime(created.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")
+
+
+def prune_egress(host: str | None = None):
+    """Remove the proxies and networks that expired egress= sandboxes left behind (an egress= start does this too)."""
+    Sandbox(host=host)._gc_egress()
+
+
 def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sandbox]:
     """Every agvisor sandbox on that docker host, running or not, as handles: exec(), stop() and delete() work.
     Each has `.created` (when its container was made) and `.owner`. `owner=` lists only that owner's.
@@ -531,7 +566,7 @@ def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sa
         if not label:
             sb.name = cname  # anonymous: its random container name is all there is
         sb._running, sb._has_egress = state == "running", bool(egress)  # a proxy and a network to remove too
-        sb.created = datetime.strptime(created.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")  # "... +0000 UTC": drop the zone name
+        sb.created = _parse_created(created)
         boxes.append(sb)
     return boxes
 
@@ -577,8 +612,8 @@ def create_sandbox(
               private network with no route out, and its only way out is an HTTP(S) proxy (HTTP(S)_PROXY is set) that
               lets those hosts through: `host` or `*.host` (ports 80 and 443 unless `host:port` or `host:*`), an IPv4
               address or a network. A name must resolve to public addresses; reaching a private one takes an IP entry.
-              Needs an image with python 3.12+ on the docker host (python:3.12-slim) for the proxy. Don't pass
-              network=. Headless only; fixed at creation, like limits.
+              The proxy runs python:3.12-slim (must be on the docker host) under docker's default runtime, runc: under
+              gVisor docker's DNS doesn't work. Don't pass network=. Headless only; fixed at creation, like limits.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
