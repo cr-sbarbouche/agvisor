@@ -88,8 +88,10 @@ def client(secs):
     s = _connect()
     if s is None:
         print("[new python session: variables from earlier calls are gone]", flush=True)
-        subprocess.Popen([sys.executable, "-c", os.environ["S"], "serve"], start_new_session=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server = subprocess.Popen([sys.executable, "-", "serve"], start_new_session=True,  # this file again, as data on stdin
+                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server.stdin.write(os.environ["S"].encode())
+        server.stdin.close()
         for _ in range(50):
             time.sleep(0.1)
             if s := _connect():
