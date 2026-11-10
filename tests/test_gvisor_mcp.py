@@ -5,11 +5,18 @@
 AGVISOR_HOST unset -> docker on this machine. AGVISOR_IMAGE: Debian/Ubuntu-based. (agvisor-mcp itself always uses runsc.)
 """
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 
 os.environ.update(AGVISOR_NETWORK="none", AGVISOR_IDLE_TTL="120", AGVISOR_LIFETIME="600")  # host and image come from the caller
+
+proj = tempfile.mkdtemp()  # AGVISOR_PUT_DIR: copied into every sandbox the MCP server makes
+Path(proj, "sub").mkdir()
+Path(proj, "x.txt").write_text("hello\n")
+Path(proj, "sub", "y.txt").write_text("café\n")
+os.environ["AGVISOR_PUT_DIR"] = f"{proj}:/tmp/proj"
 
 from agvisor import cli, mcp_server as m  # noqa: E402
 
@@ -25,6 +32,7 @@ def until(job, marker, seconds=60):
 
 
 try:
+    assert m.run("cat /tmp/proj/x.txt /tmp/proj/sub/y.txt") == "hello\ncafé\n\n[exit 0]"  # copied when the sandbox was made
     assert m.write_file("/tmp/a b.txt", "café\n").startswith("wrote 6 bytes")
     assert m.read_file("/tmp/a b.txt") == "café\n"
     assert "a b.txt" in m.list_files("/tmp") and m.list_files("/tmp").endswith("[exit 0]")
@@ -69,6 +77,12 @@ try:
             assert e.code == 2  # a usage error, not a traceback
         else:
             raise AssertionError("a missing file must fail")
+
+    # an anonymous sandbox that is reset gets the project again from the host: what the agent changed is gone
+    m.run("echo changed > /tmp/proj/x.txt")
+    m.reset()
+    assert m.run("cat /tmp/proj/x.txt") == "hello\n\n[exit 0]"
 finally:
     m.reset()
+    shutil.rmtree(proj, ignore_errors=True)
 print("ok")

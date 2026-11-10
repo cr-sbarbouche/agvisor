@@ -45,6 +45,14 @@ _GRACE = 600  # seconds a proxy may exist before it must have a sandbox: its san
 _JOBS = "/var/tmp/.agvisor-jobs"
 _JOB = 'timeout -k 5 "$2" sh -c "$1" >"$0/log" 2>&1 </dev/null & echo $! >"$0/pid"; wait $!; echo $? >"$0/rc"'
 _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulated under gVisor, real under these
+_PYSESSION = Path(__file__).with_name("_pysession.py").read_text()  # python(): sent along with every call
+
+
+def _py(arg, max_bytes):
+    """_pysession.py as a shell command (`arg`: the call's seconds, or "kill"). Its output is cut to max_bytes in the
+    sandbox: it is untrusted, and exec(input=) holds everything it prints in memory."""
+    return (f"command -v python3 >/dev/null || {{ echo 'python3 is not in this sandbox image (python:3.12-slim has it)'; exit 127; }}; "
+            f"S={shlex.quote(_PYSESSION)}; export S; python3 -c \"$S\" {arg} 2>&1 | tail -c {int(max_bytes)}")
 
 
 class SandboxGone(RuntimeError):
@@ -371,6 +379,23 @@ class Sandbox:
         if r.returncode:
             raise RuntimeError(f"spawn failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
         return job
+
+    def python(self, code, *, timeout=60, restart=False, max_bytes=30_000):
+        """Run Python `code` in a session that keeps variables, imports and functions between calls, like notebook cells:
+        one long-lived interpreter inside, so the image needs python3. The value of a last expression is printed.
+        Returns a CompletedProcess: stdout is what the code printed, stderr merged, the last `max_bytes` of it. A Python
+        exception is a traceback in stdout, not a return code. At `timeout` seconds the code gets a TimeoutError and
+        the session survives; stuck where that can't reach it (a C call), the session is killed and returncode is 124.
+        127 = no python3 in the image. `restart` kills the session first. The session goes with the container. Same
+        limits as exec(): timeout + 5 must stay under idle_ttl, GNU coreutils in the image."""
+        if timeout < 1:
+            raise ValueError("timeout must be >= 1 second")
+        if restart:
+            self.exec(_py("kill", max_bytes), timeout=self._short())
+        r = self.exec(_py(int(timeout), max_bytes), input=code, timeout=int(timeout) + 5)  # the alarm fires 5 s before this
+        if r.returncode == 124:
+            self.exec(_py("kill", max_bytes), timeout=self._short())
+        return r
 
     def put(self, path, data: bytes, *, timeout=120):
         """Write `data` to `path` inside: parent directories are created, an existing file is replaced. Goes through

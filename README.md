@@ -164,6 +164,16 @@ Job(sb, job_id).wait()                                         # pick a job up a
 
 `exec(timeout=)` has to stay under `idle_ttl`, so anything longer goes here. A job writes to `/var/tmp/.agvisor-jobs/<id>/` (the root filesystem, so `Limits.disk` caps its log). Exit codes: 124 = hit its `timeout`, 143 = killed (TERM), 137 = KILL. `wait()` makes one `exec()` per ~25 s. A running job does **not** keep an `idle_ttl` sandbox alive (background processes never did), but `poll()`, `read()` and `wait()` are execs, so a client that checks on it does; set `lifetime` for a hard budget. `Limits.disk` is the only cap on how much a job logs. `tests/test_gvisor_jobs.py` runs this against real gVisor.
 
+### Python sessions
+
+```python
+sb.python("import csv; rows = list(csv.reader(open('/tmp/job/input.csv')))")   # an interpreter that stays up between calls
+r = sb.python("len(rows)")                                                      # r.stdout: stdout and stderr merged, tail only
+sb.python("rows[:3]", timeout=30, restart=False)                                # restart=True throws the variables away
+```
+
+Like notebook cells: variables, imports and functions survive between calls, and the value of a last expression is printed. `r` is a `CompletedProcess`: a Python exception is a traceback in `r.stdout`, not a return code. At `timeout` (default 60 s) the code gets a `TimeoutError` and the session survives; stuck where that can't reach it (a C call), the session is killed and `returncode` is 124. 127 means no `python3` in the image (`python:3.12-slim` has it). `max_bytes` (default 30 KB) cuts what comes back, inside the sandbox. The interpreter is a process in the container, so it goes with it: a new one starts (and says so) after a reset, `lifetime` or `idle_ttl`. Each call is one `exec()`, so `timeout + 5` must stay under `idle_ttl`. It is also an MCP tool, `python`. `tests/test_gvisor_mcp.py` runs it against real gVisor.
+
 ### Expiry and cleanup
 
 ```python
@@ -198,6 +208,7 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
+| `AGVISOR_PUT_DIR` | unset. `HOST_DIR:/DEST`: a directory of yours copied into the sandbox when it is made (`put_dir`), e.g. `/home/me/proj:/workspace/proj`. Skipped when `/DEST` already exists, so a resumed named sandbox keeps its edits; an anonymous one gets the host's copy again after a reset. The whole directory goes through one tar in memory: keep it small (no `node_modules`, `.git`). Take results back with `agvisor get NAME /DEST ./out` |
 | `AGVISOR_NAME` | unset. Set it and `/workspace` is kept in a docker volume, and two more tools appear (below) |
 
 By default the sandbox is anonymous: no `/workspace` volume, so nothing is shared between projects, and the sandbox can't see your files (the agent writes code in with `write_file`).

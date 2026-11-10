@@ -1065,62 +1065,152 @@ def test_mcp_edit_file():
     m._sb = None
 
 
-def test_mcp_python():
+def test_python_session():
     import sys
     import tempfile
 
-    from agvisor import mcp_server as m
+    from agvisor.sandbox import _py
 
     d = tempfile.mkdtemp(dir="/tmp")  # short: a unix socket path is limited to ~100 characters
     env = {**os.environ, "AGVISOR_PYDIR": f"{d}/py", "PATH": f"{os.path.dirname(sys.executable)}:{os.environ['PATH']}"}
 
-    class Fake:  # runs the real command locally with sh, as exec() would inside the sandbox
-        idle_ttl = 600
+    def local(cmd, *, input=None, timeout):  # the real command, run here with sh instead of inside a sandbox
+        try:
+            return subprocess.run(["/bin/sh", "-c", cmd], input=input, capture_output=True, text=True, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess([], 124, "", "")
 
-        def exec(self, cmd, *, input=None, timeout):
-            try:
-                return subprocess.run(["sh", "-c", cmd], input=input, capture_output=True, text=True, env=env, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                return subprocess.CompletedProcess([], 124, "", "")
+    sb = Sandbox()
+    sb.exec = local
+    try:
+        r = sb.python("x = 41\nprint('hi')\nimport sys; print('err', file=sys.stderr)")
+        assert r.returncode == 0 and r.stdout.startswith("[new python session") and r.stdout.endswith("hi\nerr\n"), r.stdout
+        assert sb.python("x + 1").stdout == "42\n"  # same interpreter: no new-session notice, the last expression is printed
+        assert sb.python("def f(n): return n * 2\n").stdout == "" and sb.python("f(x)").stdout == "82\n"
+        out = sb.python("1 / 0").stdout  # an exception is a traceback, not a return code
+        assert "ZeroDivisionError" in out and 'File "<python>"' in out and "_pysession" not in out, out
+        assert "SyntaxError" in sb.python("def f(:").stdout and sb.python("x").stdout == "41\n"  # an error doesn't end the session
+        assert "SystemExit" in sb.python("raise SystemExit(3)").stdout and sb.python("x").stdout == "41\n"
+        out = sb.python("while True: pass", timeout=1).stdout  # the alarm interrupts it, the variables stay
+        assert "TimeoutError: timed out after 1 s" in out and sb.python("x").stdout == "41\n", out
+        assert sb.python("print('a' * 100_000)", max_bytes=1000).stdout == "a" * 999 + "\n"  # cut inside: the last 1000 bytes are all we keep
+        assert sb.python("x", restart=True).stdout.startswith("[new python session") and "NameError" in sb.python("y").stdout
+        # stuck where the alarm can't reach (here: ignored): exec() gives up, the session is killed
+        r = sb.python("import signal; signal.signal(signal.SIGALRM, signal.SIG_IGN)\nwhile True: pass", timeout=1)
+        assert r.returncode == 124
+        assert sb.python("1").stdout.startswith("[new python session")
+        local(_py("kill", 1000), timeout=30)
+        assert not os.path.exists(f"{d}/py/sock")
+        try:
+            sb.python("1", timeout=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("timeout < 1 must be refused")
+    finally:
+        subprocess.run(["/bin/sh", "-c", _py("kill", 1000)], env=env, capture_output=True)
+        shutil.rmtree(d, ignore_errors=True)
+
+    # no python3 in the image: say so, with the exit code
+    bare = Sandbox()
+    bare.exec = lambda cmd, *, input=None, timeout: subprocess.run(
+        ["/bin/sh", "-c", cmd], input=input, capture_output=True, text=True, env={"PATH": "/nonexistent"}, timeout=timeout)
+    r = bare.python("1")
+    assert r.returncode == 127 and "python3 is not in this sandbox image" in r.stdout
+
+
+def test_mcp_python():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        idle_ttl = 60  # exec() refuses timeout >= idle_ttl - 6
+
+        def __init__(self):
+            self.calls, self.rc, self.out, self.gone, self.stopped = [], 0, "42\n", False, False
+
+        def python(self, code, *, timeout, restart):
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            self.calls.append((code, timeout, restart))
+            return subprocess.CompletedProcess([], self.rc, self.out, "")
+
+        def stop(self):
+            self.stopped = True
 
     box = Fake()
     m._sb = None
-    try:
-        with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
-            out = m.python("x = 41\nprint('hi')\nimport sys; print('err', file=sys.stderr)")
-            assert out.startswith("[new python session") and out.endswith("hi\nerr\n"), out
-            assert m.python("x + 1") == "42\n"  # same interpreter: no new-session notice, the last expression is printed
-            assert m.python("def f(n): return n * 2\n") == "(no output)" and m.python("f(x)") == "82\n"
-            out = m.python("1 / 0")
-            assert "ZeroDivisionError" in out and 'File "<python>"' in out and "_pysession" not in out, out
-            assert "SyntaxError" in m.python("def f(:") and m.python("x") == "41\n"  # an error doesn't end the session
-            assert "SystemExit" in m.python("raise SystemExit(3)") and m.python("x") == "41\n"
-            out = m.python("while True: pass", timeout=1)  # the alarm interrupts it, the variables stay
-            assert "TimeoutError: timed out after 1 s" in out and m.python("x") == "41\n", out
-            out = m.python("print('a' * 100_000)")  # bounded: the tail is all the agent gets
-            assert len(out) <= m._MAX + 1, len(out)
-            assert m.python("x", restart=True).startswith("[new python session") and "NameError" in m.python("y")
-            # C code that never returns to the interpreter, here the alarm ignored: exec() gives up and the session is killed
-            out = m.python("import signal; signal.signal(signal.SIGALRM, signal.SIG_IGN)\nwhile True: pass", timeout=1)
-            assert out.startswith("timed out after 1 s and the python session was killed"), out
-            assert m.python("1").startswith("[new python session")
-            box.exec(m._py("kill"), timeout=30)
-            assert not os.path.exists(f"{d}/py/sock")
-    finally:
-        subprocess.run(["sh", "-c", m._py("kill")], env=env, capture_output=True)
-        shutil.rmtree(d, ignore_errors=True)
-        m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+        assert m.python("x", timeout=100) == "42\n" and box.calls[-1] == ("x", 48, False)  # clamped: exec() gives up 5 s later
+        m.python("x", timeout=10, restart=True)
+        assert box.calls[-1] == ("x", 10, True)
+        box.out = ""
+        assert m.python("x") == "(no output)"
+        box.rc, box.out = 127, "python3 is not in this sandbox image"
+        assert m.python("x").endswith("[exit 127]")
+        box.rc = 124
+        assert m.python("x", timeout=5) == "timed out after 5 s and the python session was killed: its variables are gone"
+        box.gone = True
+        assert m.python("x").startswith("sandbox was reset") and box.stopped and m._sb is None
+    m._sb = None
 
-    # no python3 in the image: say so, with the exit code
-    class NoPython:
+
+def test_mcp_put_dir():
+    import tempfile
+
+    from agvisor import mcp_server as m
+
+    class Fake:
         idle_ttl = 600
 
-        def exec(self, cmd, *, input=None, timeout):
-            return subprocess.run(["/bin/sh", "-c", cmd], input=input, capture_output=True, text=True, env={"PATH": "/nonexistent"}, timeout=timeout)
+        def __init__(self, has=False, fail=False):
+            self.calls, self.has, self.fail, self.stopped = [], has, fail, False
 
-    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: NoPython()):
-        assert "python3 is not in this sandbox image" in m.python("1") and m.python("1").endswith("[exit 127]")
-    m._sb = None
+        def exec(self, cmd, *, timeout, on_output=None):
+            self.calls.append(("exec", cmd))
+            return subprocess.CompletedProcess([], 0 if self.has else 1, "", "")  # `[ -e dest ]`
+
+        def put_dir(self, local, remote, *, timeout):
+            self.calls.append(("put_dir", local, remote))
+            if self.fail:
+                raise RuntimeError("put_dir failed")
+
+        def stop(self):
+            self.stopped = True
+
+    with tempfile.TemporaryDirectory() as d:
+        bad = Fake(fail=True)
+        boxes = [Fake(), Fake(has=True), bad]
+        m._sb = None
+        with mock.patch.object(m, "create_sandbox", lambda *a, **kw: boxes.pop(0)), \
+                mock.patch.dict(os.environ, {"AGVISOR_PUT_DIR": f"{d}:/work dir/proj"}):
+            m.run("echo hi")
+            first = m._sb
+            assert first.calls[:2] == [("exec", "[ -e '/work dir/proj' ]"), ("put_dir", d, "/work dir/proj")]
+            n = len(first.calls)
+            m.run("again")
+            assert [c[0] for c in first.calls[n:]] == ["exec"]  # copied once, not on every call
+            m.reset()
+            m.run("x")  # a second sandbox that already has /work dir/proj (a resumed named volume): the agent's edits stay
+            assert [c[0] for c in m._sb.calls] == ["exec", "exec"] and m._sb is not first
+            m.reset()
+            try:
+                m.run("x")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a failed copy must reach the caller")
+            assert m._sb is None and bad.stopped  # and the half-made sandbox is not left running
+        m._sb = None
+        for spec in (f"{d}:relative/path", f"{d}/missing:/x", d, ""):
+            with mock.patch.dict(os.environ, {"AGVISOR_PUT_DIR": spec}):
+                try:
+                    m._put()
+                except SystemExit as e:
+                    assert spec == "" or "HOST_DIR:/DEST" in str(e), spec
+                else:
+                    assert spec == "", spec  # unset is fine
+        with mock.patch.dict(os.environ, {"AGVISOR_PUT_DIR": f"{d}:/dest"}):
+            assert m._put() == (d, "/dest")
 
 
 def test_skill_frontmatter_is_strict_yaml():
@@ -1165,7 +1255,9 @@ if __name__ == "__main__":
     test_mcp_server()
     test_mcp_write_file()
     test_mcp_edit_file()
+    test_python_session()
     test_mcp_python()
+    test_mcp_put_dir()
     test_mcp_jobs()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
