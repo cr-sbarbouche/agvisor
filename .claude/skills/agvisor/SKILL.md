@@ -11,7 +11,7 @@ gVisor (`runsc`) sandboxes with CPU/memory/pids/disk limits, driven through the 
 
 - Use `run` for every command that executes code you did not write or cannot vouch for. If it fails, tell the user. Don't fall back to the host shell.
 - One sandbox lives between calls (files, installed packages) until it has been idle ~10 minutes. Then `run` reports "sandbox was reset" and the files are gone: set up again.
-- It can't see the user's files. Put code in with `write_file` (an absolute path such as `/tmp/a.py`; there is no `/workspace` here), print what you need back.
+- It can't see the user's files, except a directory the user copied in on purpose (they will say where; look with `list_files`). Put code in with `write_file` (an absolute path such as `/tmp/a.py`; there is no `/workspace` here), print what you need back.
 - Network is off unless the user set `AGVISOR_NETWORK`, or limited to a few hosts if they set `AGVISOR_EGRESS` (a 403 saying "not in this sandbox's egress allowlist" means the host isn't one of them). If `pip install` fails for that reason, ask them. Don't work around it.
 - Change part of a file with `edit_file(path, old, new)` (`old` must appear exactly once), not by sending the whole file again.
 - For data analysis or anything you explore step by step, use `python(code)`: variables and imports stay between calls, and the last expression is printed. It needs python3 in the image; if it says so, tell the user. `restart=True` clears it.

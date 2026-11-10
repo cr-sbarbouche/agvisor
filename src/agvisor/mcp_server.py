@@ -6,12 +6,13 @@ AGVISOR_CPUS (2), AGVISOR_MEMORY (2g), AGVISOR_IDLE_TTL (600 s), AGVISOR_LIFETIM
 AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sandbox(egress=)), e.g.
 "pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK.
 AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot/restore
-tools exist."""
+tools exist.
+AGVISOR_PUT_DIR (unset): HOST_DIR:/DEST, a directory of yours copied into the sandbox when it is made (put_dir), e.g.
+"/home/me/proj:/workspace/proj". Skipped when /DEST already exists, so a resumed named sandbox keeps its edits."""
 import atexit
 import os
 import shlex
 import threading
-from pathlib import Path
 
 from .limits import Limits
 from .sandbox import Job, SandboxGone, create_sandbox
@@ -19,7 +20,6 @@ from .sandbox import Job, SandboxGone, create_sandbox
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
 _READ = 100_000  # read_file(): bytes of one file
 _EDIT = 1_000_000  # edit_file(): bytes of one file
-_PYSESSION = Path(__file__).with_name("_pysession.py").read_text()  # sent along with every python() call
 _CHECKPOINT = "checkpoint"  # ponytail: one snapshot slot, so an agent can't pile up full copies of /workspace
 _sb = None  # One sandbox per server process. Anonymous unless AGVISOR_NAME is set: then /workspace is a volume with
 _lock = threading.Lock()  # no size cap, shared by every server process using that name.
@@ -33,16 +33,35 @@ def _t(sb, seconds):  # exec() refuses a timeout that could outlive the idle wat
     return max(1, min(seconds, sb.idle_ttl - 7))
 
 
+def _put():
+    """AGVISOR_PUT_DIR as (host dir, destination), or None. Checked when the server starts, not on the agent's first call."""
+    spec = _env("PUT_DIR")
+    if not spec:
+        return None
+    host, _, dest = spec.rpartition(":")  # rpartition: a Windows host path has a ':' of its own
+    if not os.path.isdir(host) or not dest.startswith("/"):
+        raise SystemExit(f"AGVISOR_PUT_DIR must be HOST_DIR:/DEST with HOST_DIR an existing directory, got {spec!r}")
+    return host, dest
+
+
 def _get():
     global _sb
     with _lock:
         if _sb is None:
             egress = [e.strip() for e in (_env("EGRESS") or "").split(",") if e.strip()]
-            _sb = create_sandbox(
+            sb = create_sandbox(
                 _env("IMAGE"), host=_env("HOST"), name=_env("NAME"),
                 **({"egress": egress} if egress else {"network": _env("NETWORK", "none")}),
                 limits=Limits(cpus=float(_env("CPUS", 2)), memory=_env("MEMORY", "2g")),
                 idle_ttl=int(_env("IDLE_TTL", 600)), lifetime=int(_env("LIFETIME", 3600)))
+            try:
+                put = _put()
+                if put and sb.exec(f"[ -e {shlex.quote(put[1])} ]", timeout=_t(sb, 30), on_output=lambda _: None).returncode:
+                    sb.put_dir(*put, timeout=_t(sb, 300))  # only when absent: a resumed volume keeps what the agent changed
+            except BaseException:
+                sb.stop()
+                raise
+            _sb = sb
         return _sb
 
 
@@ -120,12 +139,6 @@ def edit_file(path: str, old: str, new: str) -> str:
     return f"edited {path}"
 
 
-def _py(arg):  # the in-sandbox session script (_pysession.py) as a shell command; its output stays under _MAX bytes
-    return (f"command -v python3 >/dev/null || {{ echo 'python3 is not in this sandbox image: ask the user to set "
-            f"AGVISOR_IMAGE (python:3.12-slim has it)'; exit 127; }}; S={shlex.quote(_PYSESSION)}; export S; "
-            f"python3 -c \"$S\" {arg} 2>&1 | tail -c {_MAX}")
-
-
 def python(code: str, timeout: int = 60, restart: bool = False) -> str:
     """Run Python in the sandbox in a session that keeps variables, imports and functions between calls, like notebook
     cells: load data once, then explore it with small calls. The value of the last expression is printed. Output is
@@ -134,15 +147,11 @@ def python(code: str, timeout: int = 60, restart: bool = False) -> str:
     deleted. Needs python3 in the sandbox image."""
     try:
         sb = _get()
-        if restart:
-            sb.exec(_py("kill"), timeout=_t(sb, 30))
-        wait = _t(sb, timeout + 5)  # the alarm in the session fires 5 s before exec() gives up
-        r = sb.exec(_py(max(1, wait - 5)), input=code, timeout=wait)
-        if r.returncode == 124:  # the code is stuck where the alarm can't reach it (a C call): only a restart frees us
-            sb.exec(_py("kill"), timeout=_t(sb, 30))
-            return f"timed out after {timeout} s and the python session was killed: its variables are gone"
+        r = sb.python(code, timeout=max(1, _t(sb, timeout + 5) - 5), restart=restart)  # exec() gives up 5 s after it
     except SandboxGone as e:
         return _gone(e)
+    if r.returncode == 124:  # stuck where the alarm can't reach (a C call): the session was killed
+        return f"timed out after {timeout} s and the python session was killed: its variables are gone"
     return (r.stdout or "(no output)") + (f"\n[exit {r.returncode}]" if r.returncode else "")
 
 
@@ -220,6 +229,7 @@ def restore() -> str:
 
 
 def main():
+    _put()  # a bad AGVISOR_PUT_DIR stops the server here
     try:
         from mcp.server.mcpserver import MCPServer  # mcp 2.x: v1's FastMCP was renamed
     except ImportError:
