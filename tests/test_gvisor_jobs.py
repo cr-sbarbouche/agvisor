@@ -1,4 +1,4 @@
-"""Needs a docker host with real gVisor (CI has no runsc): spawn() runs a shell script that relies on GNU timeout, setsid-less
+"""Needs a docker host with real gVisor (the `gvisor` job in ci.yml has it): spawn() runs a shell script that relies on GNU timeout, setsid-less
 process groups and /proc, which only a real container can check.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=python:3.12-slim uv run python tests/test_gvisor_jobs.py

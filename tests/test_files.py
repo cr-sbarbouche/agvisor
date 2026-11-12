@@ -1,4 +1,4 @@
-"""Needs a docker host (the shell commands behind put() and get() run in a real container; CI has no daemon):
+"""Needs a docker host (the shell commands behind put() and get() run in a real container; the `gvisor` job in ci.yml runs it):
 
     AGVISOR_HOST=ssh://user@vm uv run python tests/test_files.py
     AGVISOR_RUNTIME=runc uv run python tests/test_files.py      # e.g. Docker Desktop, where there is no runsc

@@ -1,4 +1,4 @@
-"""Needs a docker host with real gVisor and internet (CI has neither): egress= builds a private network and a proxy container.
+"""Needs a docker host with real gVisor and internet (the `gvisor` job in ci.yml has both): egress= builds a private network and a proxy container.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=python:3.12-slim uv run python tests/test_gvisor_egress.py
 

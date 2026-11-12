@@ -1,4 +1,4 @@
-"""Needs a docker host with real gVisor: the disk cap is a runsc feature, so CI (no runsc) can't run this.
+"""Needs a docker host with real gVisor: the disk cap is a runsc feature, which the `gvisor` job in ci.yml has.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=node:22-alpine uv run python tests/test_gvisor_disk.py
 

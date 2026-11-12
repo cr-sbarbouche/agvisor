@@ -86,3 +86,38 @@ jobs:
           uvx --from "semgrep==$SEMGREP_VERSION" semgrep scan --metrics off --error
           --config p/python --config p/javascript --config p/github-actions --config p/dockerfile
           src web/agvisor-desktop.js gateway/gateway.js gateway/Dockerfile web/e2e.mjs .github
+
+  gvisor: # the tests/test_gvisor_*.py scripts, on the runner's own docker with real runsc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # ponytail: pinned by hand (Dependabot can't see it): bump the release and its hash from the .sha512 next to the tarball.
+    env:
+      GVISOR_RELEASE: "20261026.0"
+      GVISOR_SHA512: e6aa030fb8379fe92b53e9b8b696419e0dce8a3bbcc7d4c1cf76b2ea3d6569eabd7360e694deda6ccbdcd77095b3e82ca0f90a3d8fd13a3e5d6b11cd29fe4649
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: install gVisor and register it as the docker runtime "runsc"
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/x86_64/gvisor.tar.zstd"
+          echo "$GVISOR_SHA512  $RUNNER_TEMP/gvisor.tar.zstd" | sha512sum -c -
+          mkdir "$RUNNER_TEMP/gvisor"
+          tar --zstd -xf "$RUNNER_TEMP/gvisor.tar.zstd" -C "$RUNNER_TEMP/gvisor"
+          sudo cp -r "$RUNNER_TEMP"/gvisor/* /usr/local/bin/
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc
+      - name: tests/test_gvisor_*.py and test_files.py (every script runs, so one failure doesn't hide the others)
+        env:
+          AGVISOR_IMAGE: python:3.12-slim
+          AGVISOR_RUNTIME: runsc
+        run: |
+          rc=0
+          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp; do
+            echo "::group::test_$t"
+            uv run --locked --extra mcp python "tests/test_$t.py" || { echo "::error::test_$t failed"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
