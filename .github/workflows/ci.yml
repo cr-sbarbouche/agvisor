@@ -109,13 +109,13 @@ jobs:
           sudo runsc install
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | grep -q runsc
-      - name: tests/test_gvisor_*.py and test_files.py (every script runs, so one failure doesn't hide the others)
+      - name: the real-runsc test scripts (every script runs, so one failure doesn't hide the others)
         env:
           AGVISOR_IMAGE: python:3.12-slim
           AGVISOR_RUNTIME: runsc
         run: |
           rc=0
-          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp; do
+          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio; do
             echo "::group::test_$t"
             uv run --locked --extra mcp python "tests/test_$t.py" || { echo "::error::test_$t failed"; rc=1; }
             echo "::endgroup::"
