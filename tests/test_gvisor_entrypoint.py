@@ -1,4 +1,4 @@
-"""Needs a docker host with real gVisor (CI has no runsc): an image with an ENTRYPOINT must still work.
+"""Needs a docker host with real gVisor (the `gvisor` job in ci.yml has it): an image with an ENTRYPOINT must still work.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=ubuntu:24.04 uv run python tests/test_gvisor_entrypoint.py
 

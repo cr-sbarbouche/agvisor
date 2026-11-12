@@ -1,4 +1,4 @@
-"""Needs a docker host with real gVisor (CI has no runsc): snapshot() and restore() copy volumes in a runsc container.
+"""Needs a docker host with real gVisor (the `gvisor` job in ci.yml has it): snapshot() and restore() copy volumes in a runsc container.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=node:22-alpine uv run python tests/test_gvisor_snapshot.py
 

@@ -1,4 +1,4 @@
-"""Needs a docker host (CI has none): the MCP file and job tools and the CLI put/get, called as functions against a real sandbox.
+"""Needs a docker host (the `gvisor` job in ci.yml has one): the MCP file and job tools and the CLI put/get, called as functions against a real sandbox.
 
     AGVISOR_HOST=ssh://user@vm AGVISOR_IMAGE=python:3.12-slim AGVISOR_RUNTIME=runsc uv run python tests/test_gvisor_mcp.py
 
