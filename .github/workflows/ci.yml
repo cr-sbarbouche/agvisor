@@ -109,13 +109,27 @@ jobs:
           sudo runsc install
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | grep -q runsc
+      # The EC2 metadata service, faked: a sandbox on bridge reaches the real one THROUGH the host (it lives off the instance),
+      # so the fake sits behind a veth in a network namespace and the host forwards to it, DOCKER-USER chain included.
+      # It shadows the runner's own 169.254.169.254 (Azure's) route for the rest of the job.
+      - name: a fake EC2 metadata service at 169.254.169.254
+        run: |
+          sudo ip netns add imds
+          sudo ip link add imds0 type veth peer name imds1 netns imds
+          sudo ip addr add 10.99.0.1/24 dev imds0
+          sudo ip link set imds0 up
+          sudo ip netns exec imds sh -c 'ip addr add 10.99.0.2/24 dev imds1 && ip link set imds1 up && ip link set lo up && ip addr add 169.254.169.254/32 dev lo && ip route add default via 10.99.0.1'
+          sudo ip route replace 169.254.169.254/32 via 10.99.0.2
+          sudo ip netns exec imds setsid nohup python3 tests/fake_imds.py > /dev/null 2>&1 &
+          sleep 1
+          curl -fsS http://169.254.169.254/latest/meta-data/instance-id
       - name: the real-runsc test scripts (every script runs, so one failure doesn't hide the others)
         env:
           AGVISOR_IMAGE: python:3.12-slim
           AGVISOR_RUNTIME: runsc
         run: |
           rc=0
-          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio; do
+          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio gvisor_imds; do
             echo "::group::test_$t"
             uv run --locked --extra mcp python "tests/test_$t.py" || { echo "::error::test_$t failed"; rc=1; }
             echo "::endgroup::"
