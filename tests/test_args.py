@@ -462,6 +462,52 @@ def test_put_and_get():
         raise AssertionError("a missing file must raise")
 
 
+def test_isolated_network():
+    assert "--network=agvisor-isolated" in Sandbox(network="isolated").run_args()
+    assert "--network=bridge" in Sandbox().run_args()  # the default is not touched
+    try:
+        Sandbox(network="isolated", egress=["x.org"])  # egress= has its own network
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("egress= and network='isolated' together")
+
+    inputs = []
+
+    def start(icc, rc=0, running=False, probe_fails=False, **kw):  # create_sandbox with a docker whose network says `icc` (and `inspect` exits `rc`)
+        calls = []
+
+        def run(cmd, **kw2):
+            calls.append(cmd[1:])
+            inspect = cmd[1:3] == ["network", "inspect"]
+            probe = "--entrypoint=cat" in cmd  # the throwaway container that reads the default bridge's resolv.conf
+            out = icc if inspect else "true\n" if running and cmd[1] == "inspect" else "nameserver 9.9.9.9\n" if probe else ""
+            if cmd[1] == "exec":
+                inputs.append(kw2.get("input"))
+            bad = (inspect and rc) or (probe and probe_fails)
+            return subprocess.CompletedProcess(cmd, 1 if bad else 0, out, "boom" if bad else "")
+
+        with mock.patch("agvisor.sandbox.subprocess.run", run):
+            try:
+                create_sandbox(network="isolated", **kw)
+            except RuntimeError as e:
+                return calls, e
+        return calls, None
+
+    calls, err = start("false\n")  # created with traffic off, checked, then the sandbox starts on it, with working DNS
+    assert err is None and [c[:2] if c[0] == "network" else c[:1] for c in calls] == \
+        [["network", "create"], ["network", "inspect"], ["run"], ["run"], ["exec"]]
+    assert calls[0] == ["network", "create", "-o", "com.docker.network.bridge.enable_icc=false", "--label=agvisor.isolated=1", "agvisor-isolated"]
+    assert "--network=bridge" in calls[3] and calls[4][:4] == ["exec", "-i", "-u", "root"] and inputs == ["nameserver 9.9.9.9\n"]  # docker's 127.0.0.11 is dead under gVisor
+    for icc, rc in (("true\n", 0), ("\n", 0), ("", 1)):  # a network of that name with traffic ON, a plain one with no option, none at all
+        calls, err = start(icc, rc)
+        assert err and "run" not in [c[0] for c in calls], (icc, rc, err)  # no sandbox is started on it
+    calls, err = start("true\n", running=True, name="proj")  # a named one left running is re-attached: no network work, no DNS rewrite
+    assert err is None and "network" not in [c[0] for c in calls] and "exec" not in [c[0] for c in calls]
+    calls, err = start("false\n", probe_fails=True)  # no resolver config: the sandbox is removed, not left without DNS
+    assert err and calls[-1][:2] == ["rm", "-f"], (err, calls[-1])
+
+
 def test_egress_args():
     for bad in ({"egress": []}, {"egress": ["*"]}, {"egress": ["a b"]}, {"egress": ["a,b"]}, {"egress": ["1.2.3.4/33"]},
                 {"egress": ["x.org:0"]}, {"egress": ["x.org:99999"]}, {"egress": ["x.org:"]}, {"egress": ["::1"]},
@@ -1244,6 +1290,7 @@ if __name__ == "__main__":
     test_idle_ttl()
     test_list_sandboxes()
     test_owner()
+    test_isolated_network()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     test_put_and_get()

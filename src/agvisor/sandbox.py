@@ -38,6 +38,8 @@ wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
 """
 _PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
 _PROXY_RUNTIME = "runc"  # not gVisor: there, docker's embedded DNS (127.0.0.11) doesn't work, and the proxy couldn't resolve names
+_ISOLATED = "agvisor-isolated"  # network="isolated": one docker bridge, shared, on which containers can't reach each other
+_ICC = "com.docker.network.bridge.enable_icc"
 _GRACE = 600  # seconds a proxy may exist before it must have a sandbox: its sandbox's image may still be downloading
 # spawn(): a job lives in _JOBS/<id>/{log,pid,rc}. The rootfs, so `disk` caps what a job logs (/tmp is RAM under gVisor).
 # _JOB runs as `sh -c _JOB DIR COMMAND TIMEOUT` (0 = none): GNU timeout starts a process group of its own whose id is its
@@ -192,7 +194,7 @@ class Sandbox:
         l = self.limits
         a = ["run", "-d", f"--runtime={self.runtime}", f"--name={self.name}",
              f"--cpus={l.cpus}", f"--memory={l.memory}", f"--memory-swap={l.memory}",
-             f"--pids-limit={l.pids}", f"--network={self._net if self.egress else self.network}",
+             f"--pids-limit={l.pids}", f"--network={self._net if self.egress else _ISOLATED if self.network == 'isolated' else self.network}",
              # gVisor caps the rootfs overlay (a file on the host disk): writes past it get ENOSPC. Per-container,
              # no daemon setting needed. `root:` only: `all:` would also overlay /workspace and stop it persisting.
              f"--annotation=dev.gvisor.flag.overlay2=root:self,size={l.disk}"]
@@ -293,6 +295,25 @@ class Sandbox:
         # `until`: not a network that another start is setting up right now
         self._docker("network", "prune", "-f", "--filter", "label=agvisor.egress", "--filter", "until=60s", check=False)
 
+    def _isolated_up(self):
+        """network="isolated": make sure the shared bridge exists, and really has inter-container traffic off. `create`
+        on an existing network fails, which is fine: the check below is what matters (a network of that name that
+        someone else made, with traffic on, must not pass for an isolated one)."""
+        made = self._docker("network", "create", "-o", f"{_ICC}=false", "--label=agvisor.isolated=1", _ISOLATED, check=False)
+        icc = self._docker("network", "inspect", "-f", f'{{{{index .Options "{_ICC}"}}}}', _ISOLATED, check=False)
+        if icc.returncode:
+            raise RuntimeError(made.stderr.strip())
+        if icc.stdout.strip() != "false":
+            raise RuntimeError(f"docker network {_ISOLATED!r} exists but lets containers talk to each other: remove it (docker network rm {_ISOLATED})")
+
+    def _isolated_dns(self):
+        """A user-defined network hands containers docker's embedded DNS (127.0.0.11), which doesn't work under gVisor:
+        no name resolves, not even with --dns. So the sandbox gets the resolver config that a container on the default
+        bridge gets (the host's real upstream servers), read from a throwaway container on that bridge."""
+        r = self._docker("run", "--rm", f"--runtime={self.runtime}", "--network=bridge", "--entrypoint=cat", self.image,
+                         "/etc/resolv.conf")
+        self._docker("exec", "-i", "-u", "root", self.name, "sh", "-c", "cat > /etc/resolv.conf", input=r.stdout)
+
     def _egress_down(self):
         self._docker("rm", "-f", self._proxy, check=False)
         self._docker("network", "rm", self._net, check=False)
@@ -306,6 +327,8 @@ class Sandbox:
         if not resumed:
             if self.persistent:  # a stopped leftover would block the name; its data lives in the volume
                 self._docker("rm", "-f", self.name, check=False)
+            if self.network == "isolated":
+                self._isolated_up()
             try:
                 env = self._egress_up() if self.egress else None
                 self._docker(*self.run_args(), input=env)
@@ -315,6 +338,8 @@ class Sandbox:
                 raise
         self._running = True  # the container exists from here, so stop() must clean up if setup fails
         try:
+            if self.network == "isolated" and not resumed:
+                self._isolated_dns()
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
                 out = self._docker("port", self.name, f"{RDP_PORT}/tcp").stdout
                 self.rdp_port = int(out.splitlines()[0].rsplit(":", 1)[1])
@@ -630,9 +655,11 @@ def create_sandbox(
               only theirs. It is a guard against mixing up names, not authentication: whoever can run docker on
               the host, or build a Sandbox by hand and call delete(), still gets past it.
 
-    network  "bridge" (internet access, default), "none" (headless only: gui needs its RDP port) or the name of a
-              docker network you created. A host firewall that drops traffic from docker0 blocks the gateway from
-              reaching a gui sandbox there: use a network of its own.
+    network  "bridge" (internet access, default), "isolated" (internet access, but sandboxes can't connect to each
+              other: they share one docker bridge, agvisor-isolated, with inter-container traffic off; it still
+              reaches the host and the internet like "bridge", and names resolve), "none" (headless only: gui needs its RDP port) or the
+              name of a docker network you created. A host firewall that drops traffic from docker0 blocks the gateway
+              from reaching a gui sandbox there: use a network of its own.
     egress   Outbound allowlist, e.g. ["pypi.org", "files.pythonhosted.org", "10.0.0.0/24:8080"]. The sandbox gets a
               private network with no route out, and its only way out is an HTTP(S) proxy (HTTP(S)_PROXY is set) that
               lets those hosts through: `host` or `*.host` (ports 80 and 443 unless `host:port` or `host:*`), an IPv4
