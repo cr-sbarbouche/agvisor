@@ -99,6 +99,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # Limits(workspace=) is an xfs project quota on docker's volumes directory: give the runner one (a loop-mounted xfs with
+      # pquota under /var/lib/docker/volumes, set up while docker is stopped; the next step starts docker again).
+      - name: xfs with project quotas under /var/lib/docker/volumes
+        run: |
+          sudo apt-get install -y -qq xfsprogs > /dev/null
+          sudo systemctl stop docker docker.socket
+          sudo truncate -s 4G /xfs.img
+          sudo mkfs.xfs -q /xfs.img
+          sudo mkdir -p /var/lib/docker/volumes
+          sudo mount -o loop,pquota /xfs.img /var/lib/docker/volumes
       - name: install gVisor and register it as the docker runtime "runsc"
         run: |
           curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/x86_64/gvisor.tar.zstd"
@@ -129,7 +139,7 @@ jobs:
           AGVISOR_RUNTIME: runsc
         run: |
           rc=0
-          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio gvisor_imds gvisor_isolated; do
+          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio gvisor_imds gvisor_isolated gvisor_workspace; do
             echo "::group::test_$t"
             uv run --locked --extra mcp python "tests/test_$t.py" || { echo "::error::test_$t failed"; rc=1; }
             echo "::endgroup::"

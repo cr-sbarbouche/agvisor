@@ -152,6 +152,8 @@ class Sandbox:
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
         if owner is not None and not re.fullmatch(_ID, owner):
             raise ValueError(f"invalid owner {owner!r}: letters, digits, '_', '.', '-' only (max 63)")
+        if limits.workspace and name is None:  # an anonymous sandbox has no volume: a cap that caps nothing would mislead
+            raise ValueError("limits.workspace caps the data volume of a named sandbox: pass name=")
         if egress is not None:
             if gui or network != "bridge":
                 raise ValueError("egress= makes its own private network: headless only, and don't pass network=")
@@ -243,11 +245,26 @@ class Sandbox:
     def _claim_volume(self):
         """The data volume of a named sandbox remembers its owner: the first create_sandbox(name=, owner=) labels it,
         and a different owner (or none) is refused. `volume create` on an existing volume returns it unchanged, so two
-        racing creators can't both win."""
-        self._docker("volume", "create", *([f"--label=agvisor.owner={self.owner}"] if self.owner else []), self.name)
-        have = self._docker("volume", "inspect", "-f", '{{index .Labels "agvisor.owner"}}', self.name).stdout.strip()
+        racing creators can't both win.
+        limits.workspace is the volume's size cap (`--opt size=`: an xfs project quota on the docker host). It is fixed
+        the same way, so a different cap than the volume has is refused instead of silently ignored."""
+        cap = self.limits.workspace
+        try:
+            self._docker("volume", "create", *([f"--label=agvisor.owner={self.owner}"] if self.owner else []),
+                         *([f"--opt=size={cap}"] if cap else []), self.name)
+        except RuntimeError as e:
+            if cap and "quota" in str(e):  # docker: "quota size requested but no quota support"
+                raise RuntimeError(f"can't cap /workspace at {cap} on this docker host ({e}): /var/lib/docker/volumes "
+                                   "must be on xfs mounted with pquota (see the README)") from None
+            raise
+        # a space between the two: neither an owner nor a size has one
+        out = self._docker("volume", "inspect", "-f", '{{index .Labels "agvisor.owner"}} {{index .Options "size"}}', self.name).stdout
+        have, _, size = out.rstrip("\n").partition(" ")
         if have != (self.owner or ""):
             raise PermissionError(f"sandbox {self.name!r} belongs to another owner")
+        if cap and size.lower() != cap.lower():
+            raise ValueError(f"sandbox {self.name!r} {f'has a workspace cap of {size}' if size else 'has no workspace cap'}, "
+                             f"not {cap}: the cap is fixed when the volume is created (delete() it first, which erases its files)")
 
     @property
     def _net(self):  # '_' after 'agvisor': no sandbox container is called like this, whatever `name=` is
@@ -547,7 +564,8 @@ class Sandbox:
 
     def snapshot(self, tag):
         """Save a copy of the data dir (/workspace) as `tag`, replacing a snapshot of that name. Named sandboxes only.
-        Kept until delete(). Costs as much disk as the data dir, uncapped like it. Stop writing first: a copy taken
+        Kept until delete(). Costs as much disk as the data dir (so at most limits.workspace, if set; the snapshot
+        itself is not capped). Stop writing first: a copy taken
         while something writes can be inconsistent."""
         snap = self._snap_volume(tag)
         self._claim_volume()  # also makes sure the volume exists: `docker run -v` would silently create an empty one
@@ -640,15 +658,16 @@ def create_sandbox(
     image     Image to run. Default: ubuntu:24.04, or the GNOME desktop image when gui=True.
     gui       True -> GNOME desktop over RDP (sb.rdp_port, sb.password, sb.desktop_token()). start() returns once the
               desktop has booted and RDP listens (~30-60 s).
-    limits    Limits(cpus, memory, pids, shm, disk). Default: 2 cores, 2g RAM, 512 processes, 5g root disk.
-              Reusable across sandboxes. `disk` doesn't cover the /workspace volume of a named sandbox.
+    limits    Limits(cpus, memory, pids, shm, disk, workspace). Default: 2 cores, 2g RAM, 512 processes, 5g root disk,
+              no cap on /workspace. Reusable across sandboxes. `disk` doesn't cover the /workspace volume of a named
+              sandbox: Limits(workspace="10g") does, on a docker host set up for it (see the README).
     name      Makes the sandbox resumable. Files in sb.data_dir (/workspace; the gnome home when gui) are kept
               in a docker volume on the host machine and survive stop(), `with` exit and lifetime expiry.
               create_sandbox(name=same) later gets them back: it re-attaches to the container if an earlier
               session left it running (processes and installed packages intact), else makes a fresh one on the
               same volume. sb.delete() erases the data. Default: anonymous, nothing is kept.
               Without owner= there is NO ownership check: anyone who passes the same name gets that sandbox.
-              The volume has no size cap either (limits.disk covers the rest).
+              The volume has no size cap unless you pass limits=Limits(workspace=...) (limits.disk covers the rest).
     owner     A label such as a tenant id (same characters as name). A named sandbox's volume is claimed by the
               first owner that creates it, and create_sandbox(name=same, owner=other) (or no owner) raises
               PermissionError instead of re-attaching, restarting or deleting it. list_sandboxes(owner=) lists
