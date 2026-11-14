@@ -26,7 +26,7 @@ The two `runtimeArgs` are only needed for GUI sandboxes (systemd needs cgroup v2
 
 (Putting the args on `runsc` itself also works and needs no `runtime=`, but then every sandbox on the host gets them.)
 
-**On AWS/Azure/GCP VMs:** with `network="bridge"` a sandbox can reach the cloud metadata endpoint (`169.254.169.254`) and read the VM's instance credentials. Block it on the host (untested here): `sudo iptables -I DOCKER-USER -d 169.254.169.254 -j DROP`, or use `network="none"`.
+**On AWS/Azure/GCP VMs:** with `network="bridge"` a sandbox can reach the cloud metadata endpoint (`169.254.169.254`) and read the VM's instance credentials. Block it on the host (CI checks this against a fake metadata service, not a real instance): `sudo iptables -I DOCKER-USER -d 169.254.169.254 -j DROP`, or use `network="none"`.
 
 GUI image (x86_64), from the [gVisor systemd post](https://gvisor.dev/blog/2026/09/17/systemd-in-gvisor/):
 
