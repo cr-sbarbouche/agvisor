@@ -1,6 +1,7 @@
 """A fake EC2 metadata service on 169.254.169.254:80 (the IMDSv2 token, and the instance id with or without it): what
 tests/test_gvisor_imds.py needs where there is no EC2 instance. The `gvisor` job in ci.yml runs it in a network namespace."""
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import TCPServer  # not HTTPServer: its server_bind() does a reverse DNS lookup (getfqdn) BEFORE listen(), which can take seconds with no DNS here
 
 TOKEN, INSTANCE_ID = "fake-token", "i-0123456789abcdef0"
 
@@ -24,4 +25,5 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("169.254.169.254", 80), H).serve_forever()
+    TCPServer.allow_reuse_address = True  # what HTTPServer sets
+    TCPServer(("169.254.169.254", 80), H).serve_forever()
