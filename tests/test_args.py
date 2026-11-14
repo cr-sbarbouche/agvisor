@@ -354,6 +354,69 @@ def test_owner():
     assert calls[0][5:7] == ["--filter", "label=agvisor.owner=u42"]
 
 
+def test_workspace_cap():
+    for ok in ("1", "100k", "512M", "10g", "1T"):
+        Limits(workspace=ok)
+    for bad in ("0", "0g", "", "1.5g", "1gb", "-1g", "lots", " 1g", "1g\n"):  # docker reads size=0 as no quota at all
+        try:
+            Limits(workspace=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted workspace={bad!r}")
+    try:
+        Sandbox(limits=Limits(workspace="1g"))  # anonymous: no volume, so no cap to set
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("workspace= on an anonymous sandbox")
+    cap = Limits(workspace="64m")
+
+    calls, run = fake_docker(volume_owner=" 64m")  # the volume has the cap: created with it, and the sandbox starts
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(name="proj", limits=cap)
+    assert calls[0][1:] == ["volume", "create", "--opt=size=64m", "agvisor-proj"] and "run" in [c[1] for c in calls]
+    calls, run = fake_docker(volume_owner="u42 64M")  # with an owner too; docker echoes the size as given, so compare ignoring case
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(name="proj", owner="u42", limits=cap)
+    assert calls[0][1:] == ["volume", "create", "--label=agvisor.owner=u42", "--opt=size=64m", "agvisor-proj"]
+    calls, run = fake_docker(volume_owner=" 64m")  # no cap asked for, volume capped: the cap stays, nothing refused
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(name="proj")
+    assert calls[0][1:] == ["volume", "create", "agvisor-proj"] and "run" in [c[1] for c in calls]
+
+    for have, why in ((" 128m", "another cap"), ("", "no cap: `volume create` handed back an uncapped volume")):
+        calls, run = fake_docker(inspect_out="true\n", volume_owner=have)  # refused before anything is re-attached or started
+        with mock.patch("agvisor.sandbox.subprocess.run", run):
+            try:
+                create_sandbox(name="proj", limits=cap)
+            except ValueError as e:
+                assert "delete() it first" in str(e), e
+            else:
+                raise AssertionError(f"accepted a volume with {why}")
+        assert {c[1] for c in calls} == {"volume"}, calls
+
+    def no_quota(cmd, **_):  # a docker host whose volumes aren't on xfs+pquota: only a size= is refused
+        refused = cmd[1:3] == ["volume", "create"] and any(a.startswith("--opt=size=") for a in cmd)
+        err = "Error response from daemon: create agvisor-proj: quota size requested but no quota support"
+        return subprocess.CompletedProcess(cmd, int(refused), "", err if refused else "")
+
+    with mock.patch("agvisor.sandbox.subprocess.run", no_quota):
+        try:
+            create_sandbox(name="proj", limits=cap)
+        except RuntimeError as e:
+            assert "pquota" in str(e) and "no quota support" in str(e), e
+        else:
+            raise AssertionError("a cap the host can't enforce must not be silently dropped")
+        create_sandbox(name="proj")  # no cap asked for: the same host is fine
+
+    calls, run = fake_docker(fail=("create",))  # some other `volume create` failure: not dressed up as a quota problem
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            create_sandbox(name="proj", limits=cap)
+        except RuntimeError as e:
+            assert str(e) == "boom", e
+
+
 def test_exec_raises_when_the_sandbox_is_gone():
     sb = Sandbox()
     gone = ["Error response from daemon: container 1a2b is not running",
@@ -1244,6 +1307,7 @@ if __name__ == "__main__":
     test_idle_ttl()
     test_list_sandboxes()
     test_owner()
+    test_workspace_cap()
     test_exec_raises_when_the_sandbox_is_gone()
     test_exec_streams_output()
     test_put_and_get()
