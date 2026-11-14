@@ -203,6 +203,10 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 - `owner=` tags a sandbox, e.g. with a tenant id: `create_sandbox(name="u42-scan7", owner="u42")`, and `list_sandboxes(owner="u42")` lists only theirs. See the `name=` note under Security for what it does and doesn't protect.
 - `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code; `put` and `get` copy files and directories (see Files in and out). A retention job is `agvisor rm --older-than 14400` in cron. `exec`, `put` and `get` don't count as activity for `idle_ttl`. `agvisor prune` removes what expired `egress=` sandboxes left behind.
 
+## Examples
+
+[`examples/`](examples/) has seven small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap). CI runs all of them against real gVisor.
+
 ## Coding agents (skill + MCP server)
 
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:

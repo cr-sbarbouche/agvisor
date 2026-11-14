@@ -145,3 +145,12 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - name: the examples (examples/*.py, every script runs, so one failure doesn't hide the others)
+        run: |
+          rc=0
+          for f in examples/*.py; do
+            echo "::group::$f"
+            uv run --locked python "$f" || { echo "::error::$f failed"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
