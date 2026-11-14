@@ -1,6 +1,6 @@
 [project]
 name = "agvisor"
-version = "0.1.5"
+version = "0.1.6"
 description = "gVisor sandboxes for coding agents, with resource limits and optional GUI"
 readme = "README.md"
 license = "MIT"
