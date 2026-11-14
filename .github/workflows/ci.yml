@@ -139,7 +139,7 @@ jobs:
           AGVISOR_RUNTIME: runsc
         run: |
           rc=0
-          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio gvisor_imds gvisor_workspace; do
+          for t in files gvisor_disk gvisor_entrypoint gvisor_snapshot gvisor_jobs gvisor_egress gvisor_mcp mcp_stdio gvisor_imds gvisor_isolated gvisor_workspace; do
             echo "::group::test_$t"
             uv run --locked --extra mcp python "tests/test_$t.py" || { echo "::error::test_$t failed"; rc=1; }
             echo "::endgroup::"
