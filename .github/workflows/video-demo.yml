@@ -1,0 +1,33 @@
+name: video-demo
+on:
+  push:
+    branches: [video-demo]
+permissions:
+  contents: read
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GVISOR_RELEASE: "20261026.0"
+      GVISOR_SHA512: e6aa030fb8379fe92b53e9b8b696419e0dce8a3bbcc7d4c1cf76b2ea3d6569eabd7360e694deda6ccbdcd77095b3e82ca0f90a3d8fd13a3e5d6b11cd29fe4649
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: install gVisor
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/x86_64/gvisor.tar.zstd"
+          echo "$GVISOR_SHA512  $RUNNER_TEMP/gvisor.tar.zstd" | sha512sum -c -
+          mkdir "$RUNNER_TEMP/gvisor"
+          tar --zstd -xf "$RUNNER_TEMP/gvisor.tar.zstd" -C "$RUNNER_TEMP/gvisor"
+          sudo cp -r "$RUNNER_TEMP"/gvisor/* /usr/local/bin/
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/v"
+          "$RUNNER_TEMP/v/bin/pip" install -q ".[inject]"
+      - run: |
+          export PATH="$RUNNER_TEMP/v/bin:$PATH"
+          python demo_video.py
